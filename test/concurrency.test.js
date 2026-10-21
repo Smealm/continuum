@@ -85,6 +85,69 @@ test('stays at the ceiling through a wall of small files below the probe peak', 
   }
 });
 
+test('a lower self-measured rate never replaces the peak the probe measured', () => {
+  const { controller } = makeController({ start: 2, max: 12 });
+
+  // One large pack measured 10 MB/s before the queue of 120 KB games started.
+  controller.observePeak(10_000_000);
+
+  // The wall itself only delivers 500 KB/s at every width, which is what used
+  // to be relearned as the new peak and pinned the job there.
+  const seen = [];
+  for (let step = 0; step < 8; step += 1) {
+    seen.push(controller.sample({ bytes: 500_000, failures: 0, elapsedMs: 1000, packs: 4 }));
+  }
+
+  assert.deepEqual(seen.map((decision) => decision.limit), [4, 8, 12, 12, 12, 12, 12, 12]);
+  assert.equal(controller.limit, 12, 'the small-file rate did not become the new ceiling');
+  assert.ok(
+    seen.every((decision) => !/fell|relearn/.test(decision.reason)),
+    `no sample should back off or relearn below the probe: ${seen.map((d) => d.reason).join(', ')}`,
+  );
+});
+
+test('a wall of small files keeps widening while more of them finish per second', () => {
+  const { controller } = makeController({ start: 2, max: 8 });
+
+  // No probe: bytes per second never move, but each added connection finishes
+  // more games (100 files/s at 2 workers, 150 at 3, 200 at 4).
+  assert.equal(controller.sample({ bytes: 500_000, failures: 0, elapsedMs: 1000, packs: 100 }).changed, false);
+  const three = controller.sample({ bytes: 500_000, failures: 0, elapsedMs: 1000, packs: 150 });
+  const four = controller.sample({ bytes: 500_000, failures: 0, elapsedMs: 1000, packs: 200 });
+
+  assert.equal(three.limit, 3);
+  assert.equal(four.limit, 4);
+  assert.match(four.reason, /files/);
+});
+
+test('a saturated link holds once neither bytes nor completions improve', () => {
+  const { controller } = makeController({ start: 2, max: 8 });
+
+  controller.sample({ bytes: 5_000_000, failures: 0, elapsedMs: 1000, packs: 40 });
+  for (let step = 0; step < 4; step += 1) {
+    const decision = controller.sample({ bytes: 5_000_000, failures: 0, elapsedMs: 1000, packs: 40 });
+    assert.equal(decision.changed, false, 'no extra worker when the link is already full');
+    assert.equal(decision.limit, 2);
+  }
+});
+
+test('a newer probe replaces an older one, even when the link got slower', () => {
+  const fast = makeController({ start: 2, max: 20 }).controller;
+  const slow = makeController({ start: 2, max: 20 }).controller;
+
+  fast.observePeak(10_000_000);
+  slow.observePeak(10_000_000);
+  slow.observePeak(2_000_000);
+
+  for (const controller of [fast, slow]) {
+    controller.sample({ bytes: 500_000, failures: 0, elapsedMs: 1000 });
+    controller.sample({ bytes: 1_900_000, failures: 0, elapsedMs: 1000 });
+  }
+
+  assert.ok(fast.limit > 4, `the 10 MB/s probe should keep the width climbing: ${fast.limit}`);
+  assert.equal(slow.limit, 4, '1.9 MB/s is at the peak the newer probe measured');
+});
+
 test('server failures halve the width and pause probing upwards', () => {
   const { controller, advance } = makeController({ start: 8 });
 

@@ -165,9 +165,14 @@ More connections only help when the bottleneck is per connection — request lat
 |---|---|---|---|---|---|
 | Throughput | 2.9 MB/s | 3.1 | 3.1 | 3.1 | 3.1 |
 
-Both measured against a local HTTP server with Continuum's own download path. That is why the controller is adaptive rather than `file size -> thread count`: it aims at a rate, not at a fixed number of connections. Every five seconds it compares goodput with the best sustained rate it has seen (and with a rate measured by the probe below) and adds workers while the download is more than 10% below that peak, doubling the width when it is less than half. Within 10% of the peak it holds: the link is being pressed. It steps back when a wider width delivers less than 85% of the peak, and halves on failures before a 60-second cooldown. **Active Workers** is the hard ceiling, so the archive never sees more than one client's configured maximum. Adaptive parallelism is off in passive mode and for changed-only passes, where the worker count is the exact number configured.
+Both measured against a local HTTP server with Continuum's own download path. That is why the controller is adaptive rather than `file size -> thread count`: it aims at a rate, not at a fixed number of connections. Every five seconds it compares the job with **two** measures and adds a worker while either one is improving:
 
-To know what the connection can do before the queue reaches a large game, adaptive active jobs run **one short probe at the start of a job, at most once an hour**. It is a real pack the job still needs, read for at most 30 seconds and stopped as soon as the rate plateaus; the bytes are discarded, never written to the target drive. What the probe measures plus what the real workers were getting at the same time is the ceiling the worker count aims for — and the rate the ETA uses. Nothing is downloaded twice: the probed pack is still downloaded normally when its turn comes.
+- **Bytes per second**, against the rate the probe measured (below) or the best this job has sustained.
+- **Completions per second** (packs plus games). A wall of 120 KB packs is limited by requests per second, not by bandwidth, so 100 slow connections adding up to the whole link is a win even when each one delivers little.
+
+That second measure is what keeps a small-file queue moving. The probe's rate is a **floor** the job climbs towards, and a self-measured sample can raise the goal above it but never lower it below it: a few minutes of tiny files is not evidence that a 10 MB/s link became a 500 KB/s link. The width grows until the probed rate is reached, the configured ceiling is hit, or neither measure improves. It steps back only when a wider width is worse on both, and halves on failures before a 60-second cooldown. A newer probe replaces an older one, even with a lower figure, because that is a fresh measurement. **Active Workers** is the hard ceiling, so the archive never sees more than one client's configured maximum. Adaptive parallelism is off in passive mode and for changed-only passes, where the worker count is the exact number configured.
+
+To know what the connection can do before the queue reaches a large game, adaptive active jobs run **one short probe at the start of a job, at most once an hour**. It is a real pack the job still needs, read for at most 30 seconds and stopped as soon as the rate plateaus; the bytes are discarded, never written to the target drive. What the probe measures plus what the real workers were getting at the same time is the rate the worker count climbs towards — and the rate the ETA uses. Nothing is downloaded twice: the probed pack is still downloaded normally when its turn comes.
 
 **Download Mode** picks which one the manager's single Start button uses. The **Start Active** and **Start Passive** buttons on the config page, **Mirror with Continuum**, and a resumed job choose explicitly and are not affected by the setting.
 
@@ -312,8 +317,8 @@ The archive servers are shared infrastructure, and Continuum is a guest on them.
   on the server as much as it speeds up the client.
 - **Concurrency is capped and measured.** Passive mode uses one worker, active
   mode never exceeds the configured ceiling, and adaptive parallelism stops
-  adding workers once the measured link speed is reached rather than hammering a
-  saturated or shaped link. Its hourly probe reads one pack for at most 30
+  adding workers once the rate the probe measured is reached (or nothing it can
+  see is improving) rather than hammering a saturated or shaped link. Its hourly probe reads one pack for at most 30
   seconds and keeps none of it: that is one large pack's worth of traffic per
   hour, not a second copy of the archive.
 
@@ -334,7 +339,7 @@ The archive servers are shared infrastructure, and Continuum is a guest on them.
 - **Changing the extreme filter mid-job takes effect on the next pass.** The image decision is part of the saved scope key, so toggling the launcher's image caching (while Respect is on) starts a fresh pass immediately; the extreme filter is applied per game, so a resumed job keeps its place and fetches the newly included games when the pass restarts (files already on disk are skipped).
 - **No mid-file resume.** Interrupted packs restart; packs are small on average, so this is cheaper than maintaining partial state.
 - **The tag-union fallback is heavy** (thousands of API calls returning hydrated game objects, hours on a full catalogue). It only runs when the database read is unavailable or switched off.
-- **The measured peak is a lower bound.** The probe and the normal downloads only show what the link has delivered so far; a faster path discovered later raises the peak, and a slower one lowers it only after five minutes. A wall of tiny packs that is limited by requests per second rather than bytes will still be slower than the peak, which is exactly why the ETA uses the peak instead of the average. If in doubt, switch adaptive parallelism off and set the exact count. Passive mode remains one worker for a reason: a full mirror is 2.26 TB from shared archive infrastructure, and the default ceiling is deliberately modest.
+- **The measured peak is a lower bound.** The probe and the normal downloads only show what the link has delivered so far; a faster path discovered later raises the peak. A peak measured *by normal downloads* is lowered after five minutes at less than half of it. A peak measured by **the probe** is not lowered that way: a wall of tiny packs that is limited by requests per second rather than bytes is not evidence that the connection got slower, so the probed rate stays the ETA's rate until a newer probe (one per job start, at most hourly) replaces it. If in doubt, switch adaptive parallelism off and set the exact count. Passive mode remains one worker for a reason: a full mirror is 2.26 TB from shared archive infrastructure, and the default ceiling is deliberately modest.
 
 ## Known bugs and what to do about them
 
@@ -392,13 +397,13 @@ test/                 node:test suites (HTTP server, fake API, temp folders)
 npm test
 ```
 
-221 tests cover:
+228 tests cover:
 
 - filename derivation, including the 113 real cached packs on the reference install (all matched)
 - streaming downloads: hashes, mismatches, redirects, 404, abort, `.part` cleanup, the Continuum User-Agent, connection reuse, `Retry-After` parsing and 401/403 classification, plus a measured latency-bound comparison (8 connections finish well under half the time of one)
-- the adaptive controller: climbing while goodput improves, doubling towards a measured peak, holding within 10% of it, backing off to the width that produced it, halving on failures with a cooldown, floor and ceiling, and a zero-length sample; the work gate's width changes and cancellation
+- the adaptive controller: climbing while goodput improves, doubling towards a measured peak, holding within 10% of it, a lower self-measured rate never replacing the probed peak, a wall of small files widening while more of them finish per second, a saturated link holding when neither measure improves, a newer probe replacing an older one, backing off to the width that produced the result, halving on failures with a cooldown, floor and ceiling, and a zero-length sample; the work gate's width changes and cancellation
 - the speed probe: a plateau stop, a hard time cap, a 404 and an abort
-- the bandwidth meter: the sustained peak surviving a wall of small files, a probe rate, the five-minute slow-phase relearn, and a reset
+- the bandwidth meter: the sustained peak surviving a wall of small files, a probe rate, a probed peak that the five-minute slow-phase relearn cannot halve, a newer probe setting a new floor, and a reset
 - the smallest-first queue: a whole-catalogue sort (the smallest game 519 records in still goes first), ties in catalogue order, games with only images left, scope filtering, and resuming from the saved queue position without repeating a finished game
 - a refusal: recorded and read back, junk ignored, the engine stopping after one 403 with no retry and no failed-pack count, automatic tasks pausing until cleared, and the manager asking before trying again
 - JSONL cursor offsets and resume across chunk boundaries

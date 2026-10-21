@@ -59,6 +59,35 @@ test('a peak is lowered only after five minutes at less than half of it', () => 
   assert.equal(meter.snapshot().peakBytesPerSecond, 4_000_000, 'half the stale peak');
 });
 
+test('a wall of small files cannot halve a peak the probe measured', () => {
+  const meter = new BandwidthMeter();
+  meter.observePeak(10_000_000);
+
+  // Twenty minutes of 120 KB packs at 500 KB/s: plenty of slow samples.
+  feed(meter, 500_000, 400, 4, 0);
+
+  assert.equal(
+    meter.snapshot().peakBytesPerSecond,
+    10_000_000,
+    'the link was measured, so the queue shape is not evidence it got slower',
+  );
+});
+
+test('a newer probe sets the floor, so a genuinely slower link can still lower the peak', () => {
+  const meter = new BandwidthMeter();
+  feed(meter, 8_000_000, 3, 1, 0);
+  meter.observePeak(8_000_000);
+  meter.observePeak(1_000_000);
+
+  // Five minutes at a quarter of the old peak: it halves, but not past the probe.
+  feed(meter, 2_000_000, 300, 2, 3000);
+  assert.equal(meter.snapshot().peakBytesPerSecond, 4_000_000);
+
+  // Ten more minutes: 4 MB/s halves to 2, then to the probe's 1 MB/s and stops.
+  feed(meter, 500_000, 600, 2, 310_000);
+  assert.equal(meter.snapshot().peakBytesPerSecond, 1_000_000);
+});
+
 test('a reset forgets the previous job', () => {
   const meter = new BandwidthMeter();
   feed(meter, 1_000_000, 3, 1, 0);

@@ -2,22 +2,25 @@
  * How many transfers to run at once, decided by what the connection actually
  * delivers instead of a fixed number.
  *
- * The controller aims at a rate, not at "is one more better than the last
- * sample". It remembers the best sustained goodput it has seen (and accepts a
- * rate measured by the engine's probe) and keeps adding workers while the job
- * is below a band around that peak. Only when the bandwidth is being pressed
- * does it hold: at that point extra connections would just split the same bytes
- * and make each game slower.
+ * Two numbers drive it, because a download is limited by two different things.
  *
- * That distinction matters for a smallest-first queue. A wall of 120 KB packs
- * cannot show the link's real ceiling, so a controller that only climbs on a 5%
- * improvement stops at two or four workers and leaves most of the connection
- * idle. Knowing the peak from a large transfer gives it something to aim for,
- * and the ramp doubles the width while it is far below, so the wall is behind
- * the job in seconds instead of minutes.
+ * The first is the rate the probe measured on one large pack. That is what the
+ * link does when it is pressed, and it is a floor under the goal: a self-sample
+ * can raise the goal above it but never push it below it. A queue of 120 KB
+ * packs is limited by requests per second, not by bandwidth, so its byte rate
+ * says nothing about the connection — treating that rate as the new peak is how
+ * a 10 MB/s link ended up pinned at 500 KB/s with no way back up.
  *
- * Server failures still back it off hard, and the ceiling is the user's
- * configured maximum, so the archive never sees more than that from one client.
+ * The second is completions per second (packs plus games). That is what a small
+ * file queue can actually show: bytes per second stay flat while more
+ * connections finish more games per second, and finishing more games is the
+ * point. The width keeps growing while either measure improves, so a hundred
+ * slow connections adding up to the whole link is a win, not a shortfall.
+ *
+ * The width stops growing when the probe's rate is reached, when it hits the
+ * configured ceiling, or when a wider width is worse on both measures. Failures
+ * still halve it with a cooldown, and the ceiling stays the user's maximum, so
+ * the archive never sees more than that from one client.
  */
 
 export interface ConcurrencyOptions {
@@ -35,6 +38,12 @@ export interface ConcurrencySample {
   /** Permanent failures since the previous sample. */
   failures: number;
   elapsedMs: number;
+  /**
+   * Packs and games finished since the previous sample. Optional: a caller that
+   * only has byte counts still works, and then only bytes decide.
+   */
+  packs?: number;
+  games?: number;
 }
 
 export interface ConcurrencyDecision {
@@ -45,24 +54,28 @@ export interface ConcurrencyDecision {
 
 /** Within this fraction of the best rate seen, the link counts as pressed. */
 const TARGET = 0.9;
-/** A sample this much better than the best seen raises the peak. */
+/** A sample this much better than the best seen counts as an improvement. */
 const IMPROVEMENT = 1.05;
-/** Below half the peak, double the width instead of adding one. */
+/** Below half the probed peak, double the width instead of adding one. */
 const FAST_RAMP = 0.5;
-/** A sample this much worse than the peak at a wider width backs off at once. */
+/** A wider width that delivers this much less than the best backs off at once. */
 const REGRESSION = 0.85;
-/** How many short samples in a row mean "the peak is stale, relearn". */
-const RELEARN_SAMPLES = 3;
 
 export class ConcurrencyController {
   private current: number;
-  private bestGoodput: number | null = null;
   /**
-   * Width that produced the best rate. Null when the peak came from a probe,
-   * where the width that produced it is not known.
+   * What the last probe measured, or null when nothing has been probed. A
+   * self-sample may raise the goal above this, never lower the goal below it.
+   */
+  private probePeak: number | null = null;
+  private bestGoodput: number | null = null;
+  /** Best packs-plus-games per second seen, so a small-file wall can still win. */
+  private bestCompletion = 0;
+  /**
+   * Width that produced the best result. Null until the first sample, and not
+   * set by a probe, where the width that produced the rate is not known.
    */
   private peakWidth: number | null = null;
-  private lowStreak = 0;
   private cooldownUntil = 0;
 
   constructor(
@@ -80,97 +93,99 @@ export class ConcurrencyController {
 
   /**
    * Accept a rate measured outside the download loop (the engine's probe of a
-   * large pack). It becomes the target the worker count climbs towards.
+   * large pack). It is a measurement of the link, so the controller will not
+   * stop below it just because the queue is full of tiny files. A newer probe
+   * does replace an older one — including with a lower figure — because that is
+   * a fresh measurement rather than the shape of the current queue.
    */
   observePeak(bytesPerSecond: number): void {
     if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) {
       return;
     }
-    if (this.bestGoodput === null || bytesPerSecond > this.bestGoodput) {
-      this.bestGoodput = bytesPerSecond;
-      this.peakWidth = null;
-      this.lowStreak = 0;
-    }
+    this.probePeak = bytesPerSecond;
   }
 
   sample(sample: ConcurrencySample): ConcurrencyDecision {
     const seconds = Math.max(0.001, sample.elapsedMs / 1000);
     const goodput = Math.max(0, sample.bytes) / seconds;
+    const completionKnown = sample.packs !== undefined || sample.games !== undefined;
+    const completion = completionKnown
+      ? (Math.max(0, sample.packs ?? 0) + Math.max(0, sample.games ?? 0)) / seconds
+      : 0;
 
     if (sample.failures > 0) {
-      this.lowStreak = 0;
       this.cooldownUntil = this.now() + (this.options.cooldownMs ?? 60_000);
       return this.apply(Math.max(1, Math.floor(this.current / 2)), 'failures; backing off');
     }
 
     if (this.now() < this.cooldownUntil) {
-      return { limit: this.current, changed: false, reason: 'cooling down after failures' };
+      return this.hold('cooling down after failures');
     }
 
-    if (this.bestGoodput === null) {
+    const first = this.bestGoodput === null;
+    if (first) {
       this.bestGoodput = goodput;
       this.peakWidth = this.current;
-      this.lowStreak = 0;
-      return { limit: this.current, changed: false, reason: 'learning the connection' };
+      this.bestCompletion = completion;
     }
 
-    if (goodput > this.bestGoodput * IMPROVEMENT) {
+    const betterBytes = goodput > this.bestGoodput! * IMPROVEMENT;
+    const betterCompletion = completionKnown && completion > this.bestCompletion * IMPROVEMENT;
+    if (betterBytes) {
       this.bestGoodput = goodput;
       this.peakWidth = this.current;
-      this.lowStreak = 0;
-      if (this.current < this.options.max) {
-        return this.apply(this.current + 1, 'throughput improved');
-      }
-      return { limit: this.current, changed: false, reason: 'at the ceiling' };
+    }
+    if (betterCompletion) {
+      this.bestCompletion = completion;
+      this.peakWidth = this.current;
     }
 
-    if (goodput >= this.bestGoodput * TARGET) {
-      this.lowStreak = 0;
-      return { limit: this.current, changed: false, reason: 'matching the measured peak' };
+    // The goal: what the probe measured, or the best this job has delivered.
+    const target = Math.max(this.probePeak ?? 0, this.bestGoodput ?? 0);
+    if (this.probePeak !== null && goodput >= target * TARGET && !betterCompletion) {
+      return this.hold('matching the measured peak');
     }
 
     if (this.current >= this.options.max) {
-      // The ceiling is already in use, so no extra worker can help.
-      return this.maybeRelearn(goodput, 'at the ceiling');
+      // No extra worker can help: the ceiling is already in use.
+      return this.hold('at the ceiling');
     }
 
-    if (this.peakWidth !== null && this.current > this.peakWidth) {
-      // A connection beyond the width that produced the peak is not paying for
-      // itself. Go back to that width instead of adding more of them.
-      if (goodput < this.bestGoodput * REGRESSION) {
-        this.lowStreak = 0;
-        return this.apply(this.peakWidth, 'throughput fell');
-      }
-      return this.maybeRelearn(goodput, 'holding');
+    if (this.probePeak !== null && goodput < this.probePeak * TARGET) {
+      // The link has been measured faster than this, and the queue has not used
+      // it. A wall of small files needs more connections, not a lower target,
+      // so close a large gap in one step and a small one by one.
+      const next = goodput < this.probePeak * FAST_RAMP
+        ? Math.min(this.options.max, this.current * 2)
+        : this.current + 1;
+      return this.apply(next, 'below the measured peak');
     }
 
-    if (this.peakWidth !== null && this.current === this.peakWidth) {
-      // This width already delivered the peak, so the shortfall is the link or
-      // the server, not too few workers. Hold instead of thrashing, and lower
-      // the target if the shortfall lasts.
-      return this.maybeRelearn(goodput, 'holding');
+    if (betterBytes || betterCompletion) {
+      return this.apply(
+        this.current + 1,
+        betterBytes ? 'throughput improved' : 'finishing more files',
+      );
     }
 
-    // Below a peak measured at another width, or below a probe result: there is
-    // headroom. Close a large gap in one step so a queue of small files does
-    // not spend minutes ramping.
-    this.lowStreak = 0;
-    const next = goodput < this.bestGoodput * FAST_RAMP
-      ? Math.min(this.options.max, this.current * 2)
-      : this.current + 1;
-    return this.apply(next, 'below the measured peak');
+    const peakWidth = this.peakWidth;
+    if (peakWidth !== null
+      && this.current > peakWidth
+      && goodput < this.bestGoodput! * REGRESSION
+      && (!completionKnown || completion <= this.bestCompletion)) {
+      // A connection beyond the width that produced the best result is not
+      // paying for itself on either measure. Go back to that width.
+      return this.apply(peakWidth, 'throughput fell');
+    }
+
+    // Nothing improved and nothing regressed: hold where the last gain was
+    // found. Unlike the old relearn, this leaves the goal alone, so a later
+    // improvement (or a new probe) can still raise it.
+    return this.hold(first ? 'learning the connection' : 'holding near the measured peak');
   }
 
-  /** Hold, and after a run of short samples accept that the peak is stale. */
-  private maybeRelearn(goodput: number, reason: string): ConcurrencyDecision {
-    this.lowStreak += 1;
-    if (this.lowStreak < RELEARN_SAMPLES) {
-      return { limit: this.current, changed: false, reason };
-    }
-    this.bestGoodput = goodput;
-    this.peakWidth = this.current;
-    this.lowStreak = 0;
-    return { limit: this.current, changed: false, reason: 'relearned the connection' };
+  private hold(reason: string): ConcurrencyDecision {
+    return { limit: this.current, changed: false, reason };
   }
 
   private apply(limit: number, reason: string): ConcurrencyDecision {

@@ -2,7 +2,7 @@
   "name": "continuum",
   "displayName": "Continuum",
   "author": "Smealm",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "launcherVersion": "12.2.0",
   "description": "Bridges Flashpoint Infinity and Flashpoint Ultimate: uses Infinity's own on-demand sources to cache the whole archive in the background, resumably and with a disk-space guard.",
   "license": "MIT",

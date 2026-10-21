@@ -266,6 +266,8 @@ export class Engine {
   private transferBytes = 0;
   private concurrencySampledBytes = 0;
   private concurrencySampledFailures = 0;
+  private concurrencySampledPacks = 0;
+  private concurrencySampledGames = 0;
   private concurrencySampledAt = 0;
   /** Set when a host answered 401/403; the job ends as an error and is not retried. */
   private denied: { status: number; url?: string } | null = null;
@@ -792,6 +794,8 @@ export class Engine {
         this.transferBytes = 0;
         this.concurrencySampledBytes = 0;
         this.concurrencySampledFailures = job.packsFailed + job.gamesFailed;
+        this.concurrencySampledPacks = job.packsDone;
+        this.concurrencySampledGames = job.gamesDone;
         this.concurrencySampledAt = this.now();
 
         if (this.changedOnly) {
@@ -1538,17 +1542,27 @@ export class Engine {
     }
     const now = this.now();
     const elapsed = now - this.concurrencySampledAt;
-    if (elapsed < 1000) {
+    // A window shorter than a second is mostly noise, but never demand a longer
+    // window than the configured sampling interval.
+    const minimum = Math.min(1000, this.deps.adaptIntervalMs ?? ADAPT_INTERVAL_MS);
+    if (elapsed < minimum) {
       return;
     }
     const failures = job.packsFailed + job.gamesFailed;
+    // Completions matter as much as bytes: a queue of tiny packs can deliver
+    // very little per second while more connections keep finishing more games,
+    // and that is the measure that decides whether another worker pays.
     const decision = controller.sample({
       bytes: Math.max(0, this.transferBytes - this.concurrencySampledBytes),
       failures: Math.max(0, failures - this.concurrencySampledFailures),
       elapsedMs: elapsed,
+      packs: Math.max(0, job.packsDone - this.concurrencySampledPacks),
+      games: Math.max(0, job.gamesDone - this.concurrencySampledGames),
     });
     this.concurrencySampledBytes = this.transferBytes;
     this.concurrencySampledFailures = failures;
+    this.concurrencySampledPacks = job.packsDone;
+    this.concurrencySampledGames = job.gamesDone;
     this.concurrencySampledAt = now;
     if (decision.changed) {
       gate.setLimit(decision.limit);

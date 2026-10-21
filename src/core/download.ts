@@ -33,7 +33,7 @@ const MAX_RETRY_AFTER_MS = 24 * 60 * 60 * 1000;
  * client would defeat the point of having one.
  */
 export const CONTINUUM_USER_AGENT =
-  'Continuum/0.4.1 (Flashpoint Infinity extension; +https://github.com/Smealm/continuum)';
+  'Continuum/0.4.2 (Flashpoint Infinity extension; +https://github.com/Smealm/continuum)';
 
 /**
  * One agent for all archive traffic, so a run of small packs reuses its

@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.4.2 — 2026-10-21
+
+### Fixed
+
+- **A wall of small files no longer becomes the new peak.** After the probe
+  measured one large pack at, say, 10 MB/s, the controller's own five-second
+  samples of 120 KB packs read only a few hundred KB/s and the old relearn
+  adopted that figure as the peak. From then on every sample was "within 10% of
+  the peak", so the width never grew again and the ETA was built on a rate the
+  link never had. The probed rate is now a **floor**: self-samples can raise the
+  goal above it but never lower it, and the width keeps climbing towards it (to
+  the configured ceiling, at most) instead of settling on the queue's shape. Only
+  a newer probe replaces it, which is a real re-measurement of the link.
+- **Completions per second are a first-class signal.** A smallest-first queue can
+  deliver very little per second while more connections finish more games, which
+  is exactly the case where extra workers are worth it. The controller now
+  receives pack and game completions with every sample and adds a worker while
+  either bytes or completions improve, so a hundred slow connections adding up to
+  the whole link are treated as progress rather than as a shortfall. When neither
+  measure improves, it holds exactly as before.
+- **The five-minute slow-phase relearn cannot halve the probed rate.** It lowered
+  the ETA's rate every five minutes towards the small-file wall, which inflated
+  the ETA on a link that had not changed. A probe-measured rate now stays the
+  ETA's rate until the next probe replaces its floor, while a peak that came from
+  normal downloads is still lowered after five minutes of the link running below
+  half of it.
+
+### Changed
+
+- The adaptive controller no longer has a "relearn the peak" step: a plateau
+  holds the current width and leaves the goal alone, so a later improvement or a
+  new probe can still raise it.
+
 ## 0.4.1 — 2026-10-21
 
 ### Fixed

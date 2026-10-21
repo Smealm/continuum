@@ -849,6 +849,77 @@ test('a refusal from the archive host stops the job at once and is recorded', as
   }
 });
 
+test('a probed link keeps the width climbing through a wall of tiny games', async () => {
+  const { paths } = tempProject();
+  // Seven 11-byte packs are the wall the queue actually downloads; the eighth
+  // is the large pending pack the probe picks up. Its size is what makes it a
+  // candidate; the probe itself is stubbed, so it still only measures.
+  const games = [1, 2, 3, 4, 5, 6, 7].map((index) => {
+    const game = makeGame(index);
+    const pack = Buffer.from(`tiny-pack-${index}`);
+    game.gameData[0].sha256 = sha256(pack);
+    game.gameData[0].size = pack.length;
+    return { game, pack };
+  });
+  const large = makeGame(8);
+  const largepack = Buffer.alloc(20 * 1024 * 1024, 7);
+  large.gameData[0].sha256 = sha256(largepack);
+  large.gameData[0].size = largepack.length;
+  games.push({ game: large, pack: largepack });
+
+  const server = await startServer({
+    '*': (request, response, url) => {
+      const match = games.find(({ game }) => `/${gameDataFilename(game.gameData[0])}` === url.pathname
+        || url.pathname.endsWith(`/${gameDataFilename(game.gameData[0])}`));
+      // A wall of 120 KB-class downloads: each request costs latency, so the
+      // byte rate stays tiny however fast the link is.
+      setTimeout(() => {
+        response.writeHead(200, { 'content-length': match ? match.pack.length : 0 });
+        response.end(match ? match.pack : '');
+      }, 200);
+    },
+  });
+
+  try {
+    const api = makeApi(games.map(({ game }) => game));
+    api.prefs.gameDataSources = [{ type: 'raw', name: 'test', arguments: [`http://127.0.0.1:${server.port}/games/`] }];
+    writeCatalogue(paths, catalogueFrom(games.map(({ game }) => game)));
+
+    const engine = makeEngine(api, paths, {
+      adaptIntervalMs: 50,
+      probeSpeed: async () => ({
+        bytes: 30 * 1024 * 1024,
+        elapsedMs: 4000,
+        bytesPerSecond: 8_000_000,
+        stopped: 'plateau',
+      }),
+    });
+
+    await engine.start(await engine.prepare(baseSettings({
+      includeImages: false,
+      order: 'smallest',
+      adaptiveWorkers: true,
+      activeWorkers: 4,
+    })));
+
+    assert.ok(
+      await waitFor(() => engine.snapshot().workers?.limit === 4),
+      `the probed 8 MB/s should widen the job past the start width: ${JSON.stringify(engine.snapshot())}`,
+    );
+    await engine.whenIdle();
+
+    const snapshot = engine.snapshot();
+    assert.equal(snapshot.status, 'done');
+    assert.equal(snapshot.job.packsDone, 8);
+    assert.ok(
+      snapshot.progress.peakBytesPerSecond >= 8_000_000,
+      'the probed peak is not replaced by the tiny-file byte rate',
+    );
+  } finally {
+    await server.close();
+  }
+});
+
 test('adaptive parallelism starts narrow, reports its ceiling and stops cleanly', async () => {
   const { paths } = tempProject();
   const game = makeGame(1);
