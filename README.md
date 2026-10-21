@@ -195,13 +195,16 @@ To know what the connection can do before the queue reaches a large game, adapti
 
 **Respect Flashpoint Settings** (on by default) makes Continuum follow the launcher preferences that change what a mirror should contain, instead of keeping its own copies:
 
-| Launcher preference | When on | When off |
+| Launcher preference | Launcher setting | What Continuum does while Respect Flashpoint Settings is on |
 |---|---|---|
-| Extreme content filter (`disableExtremeGames` + tag groups marked extreme) | Games the launcher hides are not downloaded, and are left out of the estimate | The filter is ignored; every game in scope is fetched |
-| Compressed images (`onDemandImagesCompressed`) | Images are requested with `?type=jpg` when the launcher asks for compressed ones | Images are always fetched uncompressed |
-| Image caching (`onDemandImages`) | Images are cached with the packs | Images are skipped entirely, and the start dialog says why |
+| Extreme content filter (`disableExtremeGames` + tag groups marked extreme) | on | Games the launcher hides are not downloaded, and are left out of the estimate |
+| Extreme content filter | off | Nothing is hidden; every game in scope is fetched |
+| Compressed images (`onDemandImagesCompressed`) | on | Images are requested with `?type=jpg` |
+| Compressed images | off | Images are fetched uncompressed |
+| Image caching (`onDemandImages`) | on | Logos and screenshots are cached with the packs |
+| Image caching | off | Logos and screenshots are skipped, and the start dialog says why |
 
-Once the switch is off, the launcher is ignored — including its image caching, so logos and screenshots are cached anyway. That is the one asymmetry: the only way to say "no images" is the launcher's image caching preference **with Respect Flashpoint Settings on**. There is no separate Continuum image switch any more (`continuum.includeImages` was removed in 0.4.0): keeping one made no sense next to the launcher's own choice, and someone who wants the 2.26 TB of packs but not the ~40 GB of images would be saving a rounding error while losing offline browsing. Turn image caching off in the launcher, with this switch on, to skip images.
+With **Respect Flashpoint Settings off**, none of the table applies: the extreme filter is ignored, images are always fetched uncompressed, and logos and screenshots are cached **even when the launcher's image caching is off**. The image caching row above only skips images because the launcher was being respected. That is the one asymmetry: the only way to say "no images" is the launcher's image caching preference **with Respect Flashpoint Settings on**. There is no separate Continuum image switch any more (`continuum.includeImages` was removed in 0.4.0): keeping one made no sense next to the launcher's own choice, and someone who wants the 2.26 TB of packs but not the ~40 GB of images would be saving a rounding error while losing offline browsing. Turn image caching off in the launcher, with this switch on, to skip images.
 
 The effective values are resolved once when a job is prepared, so the estimate, the saved scope key and the workers all agree. Because the image decision is part of the scope key, switching the launcher's image caching off starts a fresh pass instead of a resume that would silently skip images.
 
