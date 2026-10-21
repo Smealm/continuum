@@ -59,6 +59,27 @@ function makeGame(index) {
   };
 }
 
+/** The catalogue record the engine sees for a launcher game object. */
+function catalogueFrom(games) {
+  return games.map((game) => ({
+    id: game.id,
+    title: game.title,
+    library: game.library,
+    platforms: game.platforms,
+    tags: game.tags,
+    logo: game.logoPath,
+    screenshot: game.screenshotPath,
+    data: game.gameData.map((data) => ({
+      id: data.id,
+      gameId: data.gameId,
+      sha256: data.sha256,
+      size: data.size,
+      dateAdded: data.dateAdded,
+      present: false,
+    })),
+  }));
+}
+
 function writeCatalogue(paths, records, generation = 'gen-1') {
   const lines = records.map((record) => JSON.stringify(record)).join('\n') + '\n';
   fs.writeFileSync(paths.catalogFile, lines);
@@ -94,9 +115,11 @@ function makeApi(store) {
     disableExtremeGames: false,
     tagFilters: [],
   };
+  const playlists = [];
   return {
     prefs,
     games,
+    playlists,
     getPreferences: () => prefs,
     countGames: async () => games.size,
     findTags: async () => [],
@@ -119,6 +142,14 @@ function makeApi(store) {
     },
     findPlaylistByName: async () => {
       throw 'Playlist does not exist';
+    },
+    findPlaylists: () => playlists,
+    findPlaylist: (id, join) => {
+      const playlist = playlists.find((entry) => entry.id === id);
+      if (!playlist) {
+        return null;
+      }
+      return join ? { ...playlist, games: playlist.games || [] } : { ...playlist, games: [] };
     },
   };
 }
@@ -150,7 +181,7 @@ function makeSink() {
 async function startServer(routes) {
   const server = http.createServer((request, response) => {
     const url = new URL(request.url, 'http://127.0.0.1');
-    const handler = routes[url.pathname];
+    const handler = routes[url.pathname] || routes['*'];
     if (!handler) {
       response.statusCode = 404;
       response.end('not found');
@@ -171,6 +202,7 @@ module.exports = {
   tempProject,
   makeGame,
   makeApi,
+  catalogueFrom,
   writeCatalogue,
   quietLogger,
   makeSink,

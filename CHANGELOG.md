@@ -1,0 +1,147 @@
+# Changelog
+
+## 0.4.0 — 2026-10-21
+
+### Added
+
+- **Smallest games first** (`continuum.order`, default `smallest`): a pass
+  downloads the cheapest remaining game in a 500-record look-ahead window, with
+  playlist priority still winning. On a catalogue shaped like the archive
+  (206,796 packs, mean 10.4 MB, median 1.7 MB) it finishes **28x more games in
+  the first hour** at 5 MB/s and 8x at 50 MB/s, while total mirror time is
+  unchanged. A bounded window keeps memory flat and the saved cursor still points
+  at the earliest game the window has not handed out, so a crash re-reads at most
+  one window. `catalogue` keeps the old order.
+- **Adaptive parallelism** (`continuum.adaptiveWorkers`, default on): active
+  mode starts at two transfers, samples goodput every 15 s and raises the number
+  of workers while more connections deliver more data, holds when they do not,
+  and halves on failures before probing again. The **Active Workers** ceiling
+  now allows up to 20 and is a hard cap. Measured against a local server: 24 x 1
+  MB with 100 ms latency went from 7.3 MB/s at one connection to 45.7 MB/s at
+  eight, then stopped improving; with a 5 MB/s aggregate link every width from 1
+  to 16 delivered the same ~3 MB/s. Passive mode and changed-only passes keep a
+  fixed, exact worker count.
+- **Identifies itself to the archive.** Every request sends
+  `Continuum/<version> (Flashpoint Infinity extension; +project URL)` as its
+  User-Agent, so an operator can see who is downloading and block Continuum if
+  it ever asks for more than the archive is willing to give. Changing this string
+  to hide the client would defeat its purpose.
+- **A refusal is a permission decision.** HTTP 401/403 stops the job
+  immediately, is never retried, is not counted as a failed pack, and is written
+  to `state/denied.json`. While that marker exists automatic tasks do nothing and
+  the manager explains why; only the user pressing Start and choosing **Try
+  again** clears it.
+- **Connection reuse and `Retry-After`.** Downloads share keep-alive HTTP/HTTPS
+  agents (32 sockets, above the worker ceiling), so a run of small packs does not
+  pay a TCP/TLS handshake per file. A `Retry-After` header (seconds or HTTP date)
+  pushes the queued retry later than Continuum's own backoff.
+
+### Changed
+
+- The **Active Workers** setting is a ceiling now, not an exact count, unless
+  adaptive parallelism is switched off. The default stays 4.
+- A 401/403 is no longer queued in `retries.json`; the job ends instead.
+- **Image caching follows the launcher only while it is being respected.**
+  With **Respect Flashpoint Settings** on, launcher image caching off means no
+  logos or screenshots. With it off, the launcher is ignored and images are
+  cached with the packs anyway, because there is no separate Continuum image
+  switch to say otherwise.
+
+### Breaking
+
+- `continuum.includeImages` has been removed. It duplicated the launcher's
+  `onDemandImages` preference and let Continuum contradict it. Anyone who had it
+  switched off should switch image caching off in the launcher, with **Respect
+  Flashpoint Settings** on, instead. A mirror is ~2.26 TB of packs against
+  roughly 40 GB of images, so a separate switch was saving almost nothing while
+  breaking the "local copy of everything in scope" promise.
+
+## 0.3.0 — 2026-10-21
+
+### Added
+
+- **Keep The Mirror Current Automatically** (`continuum.autoMirror`, default
+  off): one switch for all automation. When it is on, Continuum
+  - continues an unfinished job when the launcher starts, and starts a new
+    passive pass when nothing is missing but no job is saved;
+  - checks `Data/flashpoint.sqlite` (modification time and size) and the
+    launcher's `dataVersion` every five minutes while the launcher is open, and
+    rebuilds the catalogue when either changed;
+  - downloads only the games that rebuild changed, using `state/changed.json`,
+    and starts a full pass when the rebuild found no usable list.
+  The rebuild and its report are the same ones the manager runs; nothing is
+  deleted, and a finish or a failure is not retried automatically. A rebuild
+  that fails records nothing, so the next check tries again.
+- `state/database.json` records the database a catalogue was built from, written
+  by every successful rebuild (manual or automatic).
+- `state/rebuild.json` keeps the last rebuild's comparison, so the manager can
+  show the diff summary without running it again.
+- **Download Mode** (`continuum.mode`, default `passive`) picks the mode the
+  manager's Start button uses.
+
+### Changed
+
+- **Manager redesigned.** One five-line status card (state, catalogue, job, a
+  textual progress bar and free space) and five buttons: **Start** (or
+  **Resume**, or **Pause** while a job runs), **Live progress**, **Catalogue**,
+  **Settings**, **Close**. The size and disk-space confirmation is skipped when
+  a saved job is resumed, because it was confirmed when that job started.
+  Rebuild, old-file cleanup and reset progress are one level down in the
+  Catalogue and Settings submenus. The separate **Stop now** button is gone:
+  Pause already finishes the current game and saves progress.
+- Automatic jobs run in passive mode; a resumed job keeps the mode it was
+  started with.
+
+### Breaking
+
+- `continuum.autoResume` has been removed and is replaced by
+  `continuum.autoMirror`. Both default to off, so existing behaviour only
+  changes if the old switch was on: switch the new one on to keep resuming (and
+  get the rebuilds and changed-only passes as well).
+
+## 0.2.0 — 2026-10-21
+
+### Added
+
+- **Respect Flashpoint Settings** (default on): one switch that follows the
+  launcher's own preferences instead of separate Continuum copies.
+  - Extreme-rated games are skipped when the launcher's extreme filter is on.
+  - Images are requested compressed (`?type=jpg`) when the launcher caches
+    compressed images, and uncompressed otherwise.
+  - Logos and screenshots are skipped when the launcher has image caching off,
+    and the start dialog says why.
+- **Rebuild report**: the catalogue a rebuild replaces is kept as
+  `catalog.previous.jsonl`, and the completion dialog and log compare the two —
+  new games, games removed upstream (with a few titles), and data packs whose
+  name or hash changed.
+- **Changed-only downloads**: a rebuild writes `state/changed.json` with the new
+  and updated games and the byte offset of each catalogue record, and Start
+  offers to download just those. The pass seeks straight to each record  instead of walking the catalogue, resumes on its own, and falls back to a full pass
+  when more than 5,000 games changed or no list exists. A finished list is
+  removed, so the next start is a full pass.
+- **Clean up old game files** in the manager: finds pack files in the data-packs
+  folder that no current game references, shows the counts and bytes, and only
+  deletes after an explicit choice. Superseded versions of games that still
+  exist need a separate option, files younger than 24 hours are left alone, and
+  per-file failures are reported instead of stopping the pass.
+- Cross-platform sqlite3 discovery for the fast catalogue build: the Flashpoint
+  folder (`Legacy/`, `Legacy/bin/`, `Utilities/`), `PATH`, and a new **SQLite
+  Tool Path** setting. Candidates are checked with `sqlite3 --version` before
+  they are used, and a missing execute bit is restored on macOS and Linux.
+
+### Changed
+
+- The effective image and extreme-filter settings are resolved once per job, so
+  the estimate, the saved scope key and the workers agree. Turning the
+  launcher's image caching off now starts a fresh pass rather than resuming a
+  job that would silently skip images.
+- Status and start dialogs show when the launcher's settings are being followed.
+- Nothing is deleted automatically apart from Continuum's own `.part` leftovers;
+  old pack files are removed only through the confirmed cleanup action.
+
+### Breaking
+
+- `continuum.respectExtremeFilter` has been removed and is replaced by
+  `continuum.respectFlashpointSettings`. The new switch defaults to on, so a
+  user who had deliberately turned the extreme filter off must turn the new
+  switch off once. No other setting changed key or default.

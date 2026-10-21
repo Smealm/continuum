@@ -25,6 +25,13 @@ export class JsonlCursor<T> {
     return this.position - this.buffer.length;
   }
 
+  /** Reposition to an absolute byte offset. Used to jump to playlist games. */
+  seek(offset: number): void {
+    this.position = Math.max(0, offset);
+    this.buffer = Buffer.alloc(0);
+    this.eof = false;
+  }
+
   async next(): Promise<{ value: T; offset: number; startOffset: number } | null> {
     if (!this.handle) {
       this.handle = await fsp.open(this.filePath, 'r');

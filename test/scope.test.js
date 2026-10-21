@@ -41,11 +41,14 @@ test('extreme filter skips matching tags', () => {
   assert.equal(matchesScope(game, { ...filter, excludeExtreme: false }), true);
 });
 
-test('scopeKey changes with scope and image setting', () => {
+test('scopeKey changes with scope, image setting and pass kind', () => {
   const base = scopeKey({ kind: 'all', value: '' }, true);
   assert.equal(base, scopeKey({ kind: 'all', value: '' }, true));
   assert.notEqual(base, scopeKey({ kind: 'all', value: '' }, false));
   assert.notEqual(base, scopeKey({ kind: 'platform', value: 'Flash' }, true));
+  // A changed-only pass is a different job from a full pass over the same scope.
+  assert.notEqual(base, scopeKey({ kind: 'all', value: '' }, true, true));
+  assert.equal(scopeKey({ kind: 'all', value: '' }, true, true), scopeKey({ kind: 'all', value: '' }, true, true));
 });
 
 test('unknown scope kinds normalize to all', () => {

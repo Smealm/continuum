@@ -78,6 +78,17 @@ export function formatPercent(done: number, total: number): string {
   return `${Math.min(100, (done / total) * 100).toFixed(done === total ? 0 : 1)}%`;
 }
 
+/**
+ * A textual progress bar for dialog messages, which have no progress widget
+ * unless the dialog is opened with a handle. Clamped to 0..100% and `width`
+ * cells wide.
+ */
+export function progressBar(percent: number, width = 16): string {
+  const safe = Number.isFinite(percent) ? Math.min(1, Math.max(0, percent)) : 0;
+  const filled = Math.round(safe * width);
+  return `${'█'.repeat(filled)}${'░'.repeat(Math.max(0, width - filled))}`;
+}
+
 /** Join a base URL and a relative path without doubling or dropping slashes. */
 export function joinUrl(base: string, relative: string): string {
   return `${base.replace(/\/+$/, '')}/${relative.replace(/^\/+/, '')}`;

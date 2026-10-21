@@ -18,6 +18,8 @@ export interface ContinuumContext {
   /** True unless "Fast Catalogue Build" is switched off in the settings. */
   readFastCatalogue(): boolean;
   readSettings(mode: EngineMode): Settings;
+  /** The mode the manager's single Start button uses. */
+  readMode(): EngineMode;
   /** Free bytes on the target volume, or null when the OS cannot tell us. */
   probeFreeBytes(target: string): Promise<number | null>;
 }

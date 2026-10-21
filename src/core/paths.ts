@@ -1,4 +1,5 @@
 import * as path from 'path';
+import { previousCatalogPath } from './catalog';
 import { ContinuumPreferences, Paths } from './types';
 
 /**
@@ -24,15 +25,22 @@ export function resolvePaths(
   extensionPath: string,
 ): Paths {
   const stateDir = path.join(extensionPath, 'state');
+  const catalogFile = path.join(stateDir, 'catalog.jsonl');
   return {
     flashpointRoot,
     dataPacksDir: resolveAgainst(flashpointRoot, preferences.dataPacksFolderPath || 'Data/Games'),
     imagesDir: resolveAgainst(flashpointRoot, preferences.imageFolderPath || 'Data/Images'),
     stateDir,
     databaseFile: path.join(flashpointRoot, 'Data', 'flashpoint.sqlite'),
-    catalogFile: path.join(stateDir, 'catalog.jsonl'),
+    databaseStateFile: path.join(stateDir, 'database.json'),
+    catalogFile,
     catalogMetaFile: path.join(stateDir, 'catalog.json'),
+    catalogPreviousFile: previousCatalogPath(catalogFile),
+    changedFile: path.join(stateDir, 'changed.json'),
+    rebuildReportFile: path.join(stateDir, 'rebuild.json'),
+    deniedFile: path.join(stateDir, 'denied.json'),
     failuresFile: path.join(stateDir, 'failures.jsonl'),
+    retriesFile: path.join(stateDir, 'retries.json'),
     jobFile: path.join(stateDir, 'job.json'),
   };
 }

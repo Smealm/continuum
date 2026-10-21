@@ -20,10 +20,42 @@ export interface FetchResult {
 
 const MAX_REDIRECTS = 6;
 const DEFAULT_TIMEOUT_MS = 60_000;
-const DEFAULT_UA = 'Continuum/0.1 (Flashpoint Infinity mirroring extension)';
+/** A server cannot ask us to stay away for longer than a day. */
+const MAX_RETRY_AFTER_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Identifies Continuum to the archive operators. It is deliberately stable and
+ * versioned, so a host can tell Continuum apart from a browser and block it if
+ * the extension ever asks for more than the archive is willing to give. The
+ * project URL is where an operator can find out what this client is.
+ *
+ * Bump the version with the extension version. Changing this string to hide the
+ * client would defeat the point of having one.
+ */
+export const CONTINUUM_USER_AGENT =
+  'Continuum/0.4.0 (Flashpoint Infinity extension; +https://github.com/Smealm/continuum)';
+
+/**
+ * One agent for all archive traffic, so a run of small packs reuses its
+ * connections instead of paying a TCP (and TLS) handshake per file. The socket
+ * ceiling is above the maximum worker count; the workers decide concurrency.
+ */
+const HTTP_AGENT = new http.Agent({ keepAlive: true, maxSockets: 32, maxFreeSockets: 8 });
+const HTTPS_AGENT = new https.Agent({ keepAlive: true, maxSockets: 32, maxFreeSockets: 8 });
+
+/** Close pooled sockets, e.g. so a test server can shut down promptly. */
+export function closeDownloadConnections(): void {
+  HTTP_AGENT.destroy();
+  HTTPS_AGENT.destroy();
+}
 
 export class HttpStatusError extends Error {
-  constructor(public readonly status: number, url: string) {
+  constructor(
+    public readonly status: number,
+    public readonly url: string,
+    /** Milliseconds the server asked us to wait (`Retry-After`), if it said. */
+    public readonly retryAfterMs?: number,
+  ) {
     super(`HTTP ${status} for ${url}`);
     this.name = 'HttpStatusError';
   }
@@ -31,6 +63,42 @@ export class HttpStatusError extends Error {
 
 export function isNotFound(error: unknown): boolean {
   return error instanceof HttpStatusError && error.status === 404;
+}
+
+/**
+ * The host did not simply fail: it told us we are not allowed to download. This
+ * is the signal a blacklist produces, so it is never retried automatically.
+ */
+export function isPermissionDenied(error: unknown): boolean {
+  return error instanceof HttpStatusError && (error.status === 401 || error.status === 403);
+}
+
+/** Parse `Retry-After` (delta seconds or an HTTP date) into milliseconds. */
+export function parseRetryAfter(value: string | string[] | undefined, now = Date.now()): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const raw = (Array.isArray(value) ? value[0] : value).trim();
+  if (!raw) {
+    return undefined;
+  }
+  // Only digits are a delta; `Date.parse('-5')` would invent a year, so a
+  // value that is neither plain seconds nor an HTTP date is ignored.
+  if (/^\d+(?:\.\d+)?$/.test(raw)) {
+    return Math.min(Number(raw) * 1000, MAX_RETRY_AFTER_MS);
+  }
+  if (!/^[A-Za-z]/.test(raw)) {
+    return undefined;
+  }
+  const at = Date.parse(raw);
+  if (!Number.isFinite(at)) {
+    return undefined;
+  }
+  return Math.min(Math.max(0, at - now), MAX_RETRY_AFTER_MS);
+}
+
+export function retryAfterMsOf(error: unknown): number | undefined {
+  return error instanceof HttpStatusError ? error.retryAfterMs : undefined;
 }
 
 /** Download a URL into `destPath`, writing to a sibling `.part` file first. */
@@ -106,9 +174,10 @@ function requestToFile(
       {
         method: 'GET',
         headers: {
-          'User-Agent': options.userAgent || DEFAULT_UA,
+          'User-Agent': options.userAgent || CONTINUUM_USER_AGENT,
           'Accept': '*/*',
         },
+        agent: transport === http ? HTTP_AGENT : HTTPS_AGENT,
       },
       (response) => {
         const status = response.statusCode || 0;
@@ -123,7 +192,11 @@ function requestToFile(
 
         if (status !== 200) {
           response.resume();
-          fail(new HttpStatusError(status, parsed.href));
+          fail(new HttpStatusError(
+            status,
+            parsed.href,
+            parseRetryAfter(response.headers['retry-after']),
+          ));
           return;
         }
 

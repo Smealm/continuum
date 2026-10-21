@@ -55,9 +55,14 @@ export function includesIgnoreCase(values: string[], needle: string): boolean {
   return values.some((value) => value.trim().toLowerCase() === target);
 }
 
-/** Stable key used to decide whether a saved job may be resumed. */
-export function scopeKey(scope: Scope, includeImages: boolean): string {
-  return `${scope.kind}:${scope.value.trim().toLowerCase()}|images=${includeImages ? 1 : 0}`;
+/**
+ * Stable key used to decide whether a saved job may be resumed. A changed-only
+ * pass is its own job, so choosing it (or going back to a full pass) does not
+ * silently continue the other kind.
+ */
+export function scopeKey(scope: Scope, includeImages: boolean, changedOnly = false): string {
+  const base = `${scope.kind}:${scope.value.trim().toLowerCase()}|images=${includeImages ? 1 : 0}`;
+  return changedOnly ? `${base}|changed=1` : base;
 }
 
 export function describeScope(scope: Scope): string {

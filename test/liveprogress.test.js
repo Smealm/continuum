@@ -28,8 +28,8 @@ const settings = {
   activeWorkers: 4,
   passiveWorkers: 1,
   passiveDelayMs: 0,
-  respectExtremeFilter: true,
-  autoResume: false,
+  respectFlashpointSettings: true,
+  autoMirror: false,
 };
 
 const idleScan = {

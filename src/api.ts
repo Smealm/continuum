@@ -26,5 +26,7 @@ export function createApi(fp: typeof flashpoint): ContinuumApi {
     saveGameData: (data) => fp.gameData.save(data),
     updateGame: (game) => fp.games.updateGame(game),
     findPlaylistByName: (name, join) => fp.games.findPlaylistByName(name, join),
+    findPlaylists: (showExtreme) => fp.games.findPlaylists(showExtreme),
+    findPlaylist: (id, join) => fp.games.findPlaylist(id, join),
   };
 }

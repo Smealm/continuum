@@ -1,7 +1,7 @@
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { CATALOG_VERSION, CatalogDataRecord, CatalogGameRecord, CatalogMeta } from './catalog';
+import { CATALOG_VERSION, CatalogDataRecord, CatalogGameRecord, CatalogMeta, keepPreviousCatalogue } from './catalog';
 import { writeJsonAtomic } from './jsonl';
 import { Logger } from './types';
 
@@ -53,6 +53,225 @@ export interface CliProcess {
 
 export type SpawnCli = (cliPath: string, args: string[]) => CliProcess;
 
+const defaultSpawnCli: SpawnCli = (cliPath, args) => spawn(cliPath, args, { windowsHide: true });
+
+/** Where a candidate came from. Only the chmod guard and the log line use it. */
+export type CliSource = 'configured' | 'flashpoint' | 'path';
+
+export interface CliCandidate {
+  path: string;
+  source: CliSource;
+}
+
+export interface LocatedCli extends CliCandidate {
+  /** The version reported by `sqlite3 --version`, e.g. "3.45.1". */
+  version: string;
+}
+
+export interface LocateCliOptions {
+  flashpointRoot: string;
+  /** Value of `continuum.sqlitePath`: a tool the user pointed at. */
+  configured?: string;
+  /** Where `sqlite3` is searched for. Defaults to `process.env.PATH`. */
+  pathEnv?: string;
+  /** Defaults to `process.platform`. */
+  platform?: NodeJS.Platform;
+  log?: Logger;
+  /** Injected in tests so no real process runs. */
+  spawnCli?: SpawnCli;
+  /** Injected in tests; defaults to `fs.chmodSync`. */
+  chmod?: (file: string, mode: number) => void;
+  /** Injected in tests; defaults to the real execute bits. */
+  isExecutable?: (file: string) => boolean;
+}
+
+/**
+ * The tool names to try in each folder. On Windows the `.exe` comes first so a
+ * stray extensionless file cannot win; elsewhere the plain name wins.
+ */
+function toolNames(platform: NodeJS.Platform): string[] {
+  return platform === 'win32' ? ['sqlite3.exe', 'sqlite3'] : ['sqlite3', 'sqlite3.exe'];
+}
+
+/**
+ * Every place the tool may live, in the order we prefer it: an explicit path,
+ * the layouts macOS and Linux use, and finally whatever is on PATH (macOS ships
+ * `/usr/bin/sqlite3`, many Linux installs do not).
+ */
+export function cliCandidates(options: LocateCliOptions): CliCandidate[] {
+  const platform = options.platform || process.platform;
+  const names = toolNames(platform);
+  const candidates: CliCandidate[] = [];
+  const seen = new Set<string>();
+  const add = (candidate: string, source: CliSource): void => {
+    const resolved = path.resolve(candidate);
+    const key = platform === 'win32' ? resolved.toLowerCase() : resolved;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    candidates.push({ path: resolved, source });
+  };
+
+  const configured = (options.configured || '').trim();
+  if (configured) {
+    // A relative path is read against the Flashpoint folder, like the
+    // launcher's own path settings.
+    add(path.isAbsolute(configured) ? configured : path.join(options.flashpointRoot, configured), 'configured');
+  }
+
+  const folders = ['Legacy', path.join('Legacy', 'bin'), 'Utilities', ''];
+  for (const folder of folders) {
+    const base = folder ? path.join(options.flashpointRoot, folder) : options.flashpointRoot;
+    for (const name of names) {
+      add(path.join(base, name), 'flashpoint');
+    }
+  }
+
+  const pathEnv = options.pathEnv === undefined ? process.env.PATH || '' : options.pathEnv;
+  for (const entry of pathEnv.split(path.delimiter)) {
+    const folder = entry.trim().replace(/^"(.*)"$/, '$1');
+    if (!folder) {
+      continue;
+    }
+    for (const name of names) {
+      add(path.join(folder, name), 'path');
+    }
+  }
+
+  return candidates;
+}
+
+function isFile(file: string): boolean {
+  try {
+    return fs.statSync(file).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function hasExecuteBit(file: string, platform: NodeJS.Platform): boolean {
+  try {
+    // Windows has no execute bits; only the read-only attribute is tracked, so
+    // every existing file counts as executable there.
+    return platform === 'win32' || (fs.statSync(file).mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Version results are cached for the session so every rebuild does not re-probe. */
+const versionCache = new Map<string, string | null>();
+
+/** Forget the cached versions, so the next lookup re-probes every tool. */
+export function resetCliCache(): void {
+  versionCache.clear();
+}
+
+/**
+ * Ask the tool for its version. A candidate that exists but cannot run (wrong
+ * architecture, missing DLL, a stub file) must not be trusted, or every
+ * rebuild would fail instead of falling back to the tag scan.
+ */
+function probeVersion(spawnCli: SpawnCli, cliPath: string, timeoutMs = 5000): Promise<string | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let output = '';
+    let timer: NodeJS.Timeout | undefined;
+    let child: CliProcess;
+    const finish = (value: string | null): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+      resolve(value);
+    };
+
+    try {
+      child = spawnCli(cliPath, ['--version']);
+    } catch {
+      finish(null);
+      return;
+    }
+
+    timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        // Already gone.
+      }
+      finish(null);
+    }, timeoutMs);
+    if (typeof timer.unref === 'function') {
+      timer.unref();
+    }
+
+    child.stdout?.on('data', (chunk: Buffer | string) => {
+      if (output.length < 256) {
+        output += chunk.toString();
+      }
+    });
+    child.stderr?.on('data', () => {
+      // A failed probe is reported by the exit code; the text is not useful.
+    });
+    child.on('error', () => finish(null));
+    child.on('close', (code) => {
+      const match = /^(\d+\.\d+(?:\.\d+)?)/.exec(output.trim());
+      finish(code === 0 && match ? match[1] : null);
+    });
+  });
+}
+
+/**
+ * Find the first candidate that exists, can be executed and answers
+ * `--version`. A tool inside the Flashpoint folder (or one the user pointed at)
+ * is made executable when the archive extraction dropped its permissions;
+ * nothing on PATH is touched.
+ */
+export async function locateCli(options: LocateCliOptions): Promise<LocatedCli | null> {
+  const platform = options.platform || process.platform;
+  const spawnCli = options.spawnCli || defaultSpawnCli;
+  const chmod = options.chmod || ((file: string, mode: number) => fs.chmodSync(file, mode));
+  const executable = options.isExecutable || ((file: string) => hasExecuteBit(file, platform));
+  const log = options.log;
+
+  for (const candidate of cliCandidates(options)) {
+    if (!isFile(candidate.path)) {
+      continue;
+    }
+
+    if (platform !== 'win32' && candidate.source !== 'path' && !executable(candidate.path)) {
+      try {
+        chmod(candidate.path, 0o755);
+        log?.debug(`Made ${candidate.path} executable.`);
+      } catch (error) {
+        log?.debug(`Could not make ${candidate.path} executable: ${error instanceof Error ? error.message : String(error)}`);
+        continue;
+      }
+    }
+
+    const cached = versionCache.get(candidate.path);
+    if (cached !== undefined) {
+      if (cached) {
+        return { ...candidate, version: cached };
+      }
+      continue;
+    }
+
+    const version = await probeVersion(spawnCli, candidate.path);
+    versionCache.set(candidate.path, version);
+    if (version) {
+      return { ...candidate, version };
+    }
+    log?.debug(`${candidate.path} did not answer as sqlite3; trying the next location.`);
+  }
+
+  return null;
+}
+
 const TABLES = [
   'game',
   'game_data',
@@ -98,30 +317,16 @@ export class FastCatalog {
   private readonly spawnCli: SpawnCli;
 
   constructor(private readonly deps: FastCatalogDeps) {
-    this.spawnCli = deps.spawnCli || ((cliPath, args) => spawn(cliPath, args, { windowsHide: true }));
+    this.spawnCli = deps.spawnCli || defaultSpawnCli;
   }
 
   /**
-   * Locate the sqlite3 tool that ships with Flashpoint. Nothing is installed
-   * or downloaded; when it is not there the caller uses the tag scan.
+   * Locate a working sqlite3 tool: an explicit path, the Flashpoint folder
+   * (Windows, macOS and Linux layouts) or PATH. Nothing is installed or
+   * downloaded; when no usable tool is found the caller uses the tag scan.
    */
-  static findCli(flashpointRoot: string): string | null {
-    const candidates = [
-      path.join(flashpointRoot, 'Legacy', 'sqlite3.exe'),
-      path.join(flashpointRoot, 'Legacy', 'sqlite3'),
-      path.join(flashpointRoot, 'Utilities', 'sqlite3.exe'),
-      path.join(flashpointRoot, 'sqlite3.exe'),
-    ];
-    for (const candidate of candidates) {
-      try {
-        if (fs.statSync(candidate).isFile()) {
-          return candidate;
-        }
-      } catch {
-        // Not there; try the next location.
-      }
-    }
-    return null;
+  static locate(options: LocateCliOptions): Promise<LocatedCli | null> {
+    return locateCli(options);
   }
 
   async scan(options: FastCatalogOptions): Promise<CatalogMeta> {
@@ -321,6 +526,7 @@ export class FastCatalog {
         throw new Error('The launcher database returned no games; the previous catalogue was kept.');
       }
 
+      await keepPreviousCatalogue(catalogFile, log);
       await fs.promises.rename(tempPath, catalogFile);
 
       const scannedAt = new Date().toISOString();

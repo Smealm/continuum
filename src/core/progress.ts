@@ -72,12 +72,17 @@ export function buildProgressView(input: ProgressInput): ProgressView {
       `${formatCount(job.packsDone)} packs`,
       formatBytes(engine.progress.sessionBytes),
       job.packsFailed > 0 ? `${formatCount(job.packsFailed)} failed` : '',
+      (job.packFlagsFailed ?? 0) > 0 ? `${formatCount(job.packFlagsFailed!)} flags pending` : '',
+      job.priority && job.priority.ids.length > 0
+        ? `${formatCount(job.priority.cursor)}/${formatCount(job.priority.ids.length)} priority`
+        : '',
     ].filter(Boolean).join(' · ');
 
     const timing = [
       elapsed > 0 ? `Elapsed ${formatDuration(elapsed)}` : '',
       speed > 0 ? `${formatBytes(speed)}/s` : '',
       speed > 0 && remaining > 0 ? `ETA ${formatDuration((remaining / speed) * 1000)}` : '',
+      engine.retryPending > 0 ? `${formatCount(engine.retryPending)} queued for retry` : '',
       freeBytes !== null ? `${formatBytes(freeBytes)} free` : '',
     ].filter(Boolean).join(' · ');
 

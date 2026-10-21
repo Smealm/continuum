@@ -5,7 +5,14 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { Readable } = require('node:stream');
 
-const { FastCatalog, catalogSource, decodeHex } = require('../dist/core/sqlite.js');
+const {
+  FastCatalog,
+  catalogSource,
+  cliCandidates,
+  decodeHex,
+  locateCli,
+  resetCliCache,
+} = require('../dist/core/sqlite.js');
 const { tempProject, quietLogger } = require('./helpers.js');
 
 const hex = (value) => Buffer.from(value, 'utf8').toString('hex');
@@ -77,14 +84,181 @@ function prepare(paths) {
   fs.mkdirSync(paths.stateDir, { recursive: true });
 }
 
-test('finds the sqlite3 tool that ships with Flashpoint', () => {
+function versionChild(payload, code = 0) {
+  const child = new EventEmitter();
+  child.stdout = Readable.from(payload ? [Buffer.from(payload)] : []);
+  child.stderr = Readable.from([]);
+  child.killed = false;
+  child.kill = () => {
+    child.killed = true;
+    setImmediate(() => child.emit('close', 1));
+    return true;
+  };
+  child.stdout.on('end', () => setImmediate(() => child.emit('close', code)));
+  return child;
+}
+
+function locateOptions(root, overrides = {}) {
+  const spawns = [];
+  const options = {
+    flashpointRoot: root,
+    pathEnv: '',
+    platform: 'linux',
+    log: quietLogger(),
+    spawnCli: (cliPath, args) => {
+      spawns.push({ cliPath, args });
+      return versionChild('3.45.1 2024-01-30 16:01:20\n');
+    },
+    ...overrides,
+  };
+  return { spawns, options };
+}
+
+function writeTool(file) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, 'binary');
+  return file;
+}
+
+test('finds the sqlite3 tool that ships with Flashpoint', async () => {
   const { root } = tempProject();
-  assert.equal(FastCatalog.findCli(root), null);
+  assert.equal(await locateCli(locateOptions(root, { platform: 'win32' }).options), null);
 
   fs.mkdirSync(path.join(root, 'Legacy'), { recursive: true });
   const exe = path.join(root, 'Legacy', 'sqlite3.exe');
   fs.writeFileSync(exe, 'binary');
-  assert.equal(FastCatalog.findCli(root), exe);
+  const found = await locateCli(locateOptions(root, { platform: 'win32' }).options);
+  assert.equal(found.path, exe);
+  assert.equal(found.source, 'flashpoint');
+});
+
+test('finds the tool in the macOS and Linux layouts', async () => {
+  const { root } = tempProject();
+  const bin = writeTool(path.join(root, 'Legacy', 'bin', 'sqlite3'));
+  assert.equal((await locateCli(locateOptions(root).options)).path, bin);
+
+  const linux = tempProject().root;
+  const utilities = writeTool(path.join(linux, 'Utilities', 'sqlite3'));
+  assert.equal((await locateCli(locateOptions(linux).options)).path, utilities);
+});
+
+test('looks at the configured path, the Flashpoint folder, then PATH', () => {
+  const { root } = tempProject();
+  const pathFolder = path.join(root, 'usr-bin');
+  const pathTool = writeTool(path.join(pathFolder, 'sqlite3'));
+
+  const candidates = cliCandidates({ flashpointRoot: root, pathEnv: pathFolder, platform: 'linux' });
+  assert.deepEqual(candidates.find((candidate) => candidate.source === 'path'), { path: pathTool, source: 'path' });
+  assert.equal(new Set(candidates.map((candidate) => candidate.path)).size, candidates.length);
+
+  const configured = writeTool(path.join(root, 'tools', 'sqlite3'));
+  const ordered = cliCandidates({
+    flashpointRoot: root,
+    configured,
+    pathEnv: pathFolder,
+    platform: 'linux',
+  });
+  assert.deepEqual(ordered[0], { path: configured, source: 'configured' });
+});
+
+test('uses a tool from PATH when the Flashpoint folder has none', async () => {
+  const { root } = tempProject();
+  const pathFolder = path.join(root, 'bin');
+  const tool = writeTool(path.join(pathFolder, 'sqlite3'));
+  const { options } = locateOptions(root, { pathEnv: pathFolder });
+
+  const found = await locateCli(options);
+  assert.equal(found.path, tool);
+  assert.equal(found.source, 'path');
+  assert.equal(found.version, '3.45.1');
+});
+
+test('skips a file that exists but does not answer as sqlite3', async () => {
+  const { root } = tempProject();
+  const stub = writeTool(path.join(root, 'Legacy', 'sqlite3'));
+  const good = writeTool(path.join(root, 'sqlite3'));
+
+  const tried = [];
+  const { options } = locateOptions(root, {
+    spawnCli: (cliPath, args) => {
+      tried.push(cliPath);
+      return cliPath === stub ? versionChild('not a database tool\n', 1) : versionChild('3.40.1 2022-12-28\n');
+    },
+  });
+
+  const found = await locateCli(options);
+  assert.deepEqual(tried, [stub, good]);
+  assert.equal(found.path, good);
+  assert.equal(found.version, '3.40.1');
+});
+
+test('gives a tool in the Flashpoint folder its execute bit back', async () => {
+  const { root } = tempProject();
+  const tool = writeTool(path.join(root, 'Legacy', 'sqlite3'));
+
+  const changes = [];
+  const changed = locateOptions(root, {
+    isExecutable: () => false,
+    chmod: (file, mode) => changes.push({ file, mode }),
+  });
+  const found = await locateCli(changed.options);
+
+  assert.equal(found.path, tool);
+  assert.deepEqual(changes, [{ file: tool, mode: 0o755 }]);
+});
+
+test('leaves an executable tool and anything on PATH alone', async () => {
+  const { root } = tempProject();
+  writeTool(path.join(root, 'Legacy', 'sqlite3'));
+
+  const changes = [];
+  const ready = locateOptions(root, {
+    isExecutable: () => true,
+    chmod: (file, mode) => changes.push({ file, mode }),
+  });
+  await locateCli(ready.options);
+  assert.deepEqual(changes, []);
+
+  const pathFolder = path.join(root, 'bin');
+  writeTool(path.join(pathFolder, 'sqlite3'));
+  const fromPath = locateOptions(tempProject().root, {
+    pathEnv: pathFolder,
+    isExecutable: () => false,
+    chmod: (file, mode) => changes.push({ file, mode }),
+  });
+  const found = await locateCli(fromPath.options);
+  assert.equal(found.source, 'path');
+  assert.deepEqual(changes, []);
+});
+
+test('skips a tool that cannot be made executable', async () => {
+  const { root } = tempProject();
+  const locked = writeTool(path.join(root, 'Legacy', 'sqlite3'));
+  const good = writeTool(path.join(root, 'sqlite3'));
+
+  const { options } = locateOptions(root, {
+    isExecutable: () => false,
+    chmod: (file) => {
+      if (file === locked) {
+        throw new Error('EPERM');
+      }
+    },
+  });
+
+  const found = await locateCli(options);
+  assert.equal(found.path, good);
+});
+
+test('probes each tool once per session', async () => {
+  const { root } = tempProject();
+  const tool = writeTool(path.join(root, 'Legacy', 'sqlite3'));
+  resetCliCache();
+  const { spawns, options } = locateOptions(root);
+
+  assert.equal((await locateCli(options)).path, tool);
+  assert.equal((await locateCli(options)).path, tool);
+  assert.equal(spawns.length, 1);
+  assert.deepEqual(spawns[0].args, ['--version']);
 });
 
 test('only uses the database when it is switched on and available', () => {
@@ -161,6 +335,22 @@ test('builds the whole catalogue from the launcher database', async () => {
 
   const meta2 = JSON.parse(fs.readFileSync(paths.catalogMetaFile, 'utf8'));
   assert.equal(meta2.version, 1);
+});
+
+test('keeps the catalogue it replaced for the rebuild report', async () => {
+  const { paths } = tempProject();
+  prepare(paths);
+
+  await makeFast(paths, dataset()).fast.scan({ signal: new AbortController().signal });
+  await makeFast(paths, dataset().replace(hex('Alpha'), hex('Alpha2')))
+    .fast.scan({ signal: new AbortController().signal });
+
+  const previous = fs.readFileSync(paths.catalogPreviousFile, 'utf8');
+  assert.match(previous, /"title":"Alpha"/);
+  assert.doesNotMatch(previous, /Alpha2/);
+
+  const current = fs.readFileSync(paths.catalogFile, 'utf8');
+  assert.match(current, /"title":"Alpha2"/);
 });
 
 test('refuses a database without the expected tables and keeps the old catalogue', async () => {

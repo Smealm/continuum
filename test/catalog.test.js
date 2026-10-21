@@ -68,6 +68,29 @@ test('unions tags into a complete, de-duplicated catalogue', async () => {
   assert.equal(loaded.games, 3);
 });
 
+test('keeps the catalogue it replaced for the rebuild report', async () => {
+  const { paths } = tempProject();
+
+  const first = new Catalog(
+    fakeApi({ Puzzle: [fakeGame('g1', ['Puzzle'], ['Flash'])] }, 1),
+    paths,
+    quietLogger(),
+  );
+  await first.scan({ signal: new AbortController().signal });
+
+  const second = new Catalog(
+    fakeApi({ Puzzle: [fakeGame('g2', ['Puzzle'], ['Flash'])] }, 1),
+    paths,
+    quietLogger(),
+  );
+  await second.scan({ signal: new AbortController().signal });
+
+  const previous = JSON.parse(fs.readFileSync(paths.catalogPreviousFile, 'utf8').trim());
+  assert.equal(previous.id, 'g1');
+  const current = JSON.parse(fs.readFileSync(paths.catalogFile, 'utf8').trim());
+  assert.equal(current.id, 'g2');
+});
+
 test('a cancelled scan leaves the previous catalogue alone', async () => {
   const { paths } = tempProject();
   fs.writeFileSync(paths.catalogFile, '{"id":"old"}\n');

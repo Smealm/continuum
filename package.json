@@ -2,7 +2,7 @@
   "name": "continuum",
   "displayName": "Continuum",
   "author": "Smealm",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "launcherVersion": "12.2.0",
   "description": "Bridges Flashpoint Infinity and Flashpoint Ultimate: uses Infinity's own on-demand sources to cache the whole archive in the background, resumably and with a disk-space guard.",
   "license": "MIT",
@@ -73,7 +73,20 @@
             "title": "Fast Catalogue Build",
             "type": "boolean",
             "default": true,
-            "description": "Read the launcher database directly with the sqlite3 tool that ships in the Flashpoint folder, instead of asking the launcher for every tag. About a minute instead of hours, and identical results. Falls back to the tag scan when the tool or the database is unavailable."
+            "description": "Read the launcher database directly with a sqlite3 tool, instead of asking the launcher for every tag. About a minute instead of hours, and identical results. The tool is looked for in the Flashpoint folder and on PATH, and is checked before it is used. Falls back to the tag scan when no working tool or database is available."
+          },
+          "continuum.sqlitePath": {
+            "title": "SQLite Tool Path",
+            "type": "string",
+            "default": "",
+            "description": "Optional. Full path to a sqlite3 program, for a system where none is found (macOS usually has /usr/bin/sqlite3; many Linux installs do not). Relative paths are read from the Flashpoint folder. A tool path here is tried before the Flashpoint folder and PATH."
+          },
+          "continuum.mode": {
+            "title": "Download Mode",
+            "type": "string",
+            "enum": ["passive", "active"],
+            "default": "passive",
+            "description": "The mode the manager's Start button uses. Passive uses one worker and pauses between games, for a mirror that runs in the background. Active uses the configured workers at full speed. The separate Start Active and Start Passive buttons still choose explicitly, and a resumed job keeps its saved mode."
           },
           "continuum.scope": {
             "title": "Download Scope",
@@ -87,12 +100,6 @@
             "type": "string",
             "default": "",
             "description": "Platform (Flash, HTML5), tag (Puzzle), library name or playlist title. Ignored when scope is all."
-          },
-          "continuum.includeImages": {
-            "title": "Download Logos and Screenshots",
-            "type": "boolean",
-            "default": true,
-            "description": "Cache the metadata images too, so browsing works offline. Adds roughly 30-40 GB for the whole archive."
           },
           "continuum.reserveGB": {
             "title": "Keep Free Disk Space (GB)",
@@ -109,16 +116,29 @@
           "continuum.activeWorkers": {
             "title": "Active Workers",
             "type": "string",
-            "enum": ["1", "2", "3", "4", "6", "8"],
+            "enum": ["1", "2", "3", "4", "6", "8", "10", "12", "16", "20"],
             "default": "4",
-            "description": "Parallel game downloads in active mode. Keep it modest; the archive servers are shared."
+            "description": "The most parallel downloads active mode may use. This is a hard ceiling: with adaptive parallelism on, Continuum starts lower and only goes this high when more connections actually deliver more data. Keep it modest; the archive servers are shared."
+          },
+          "continuum.adaptiveWorkers": {
+            "title": "Adaptive Parallelism",
+            "type": "boolean",
+            "default": true,
+            "description": "Measure what the connection actually delivers and use as many parallel downloads as help, up to the Active Workers ceiling. More connections only help when the server or latency is the limit; once the link is full they just split the same bandwidth, so Continuum backs off when goodput falls and halves on server failures."
+          },
+          "continuum.order": {
+            "title": "Download Order",
+            "type": "string",
+            "enum": ["smallest", "catalogue"],
+            "default": "smallest",
+            "description": "Smallest games first finishes far more playable games in the same total time, because the archive's sizes are heavily skewed. Total mirror time is unchanged; the big games simply arrive last. Playlist priority still wins over this. Catalogue order keeps the old sequence."
           },
           "continuum.passiveWorkers": {
             "title": "Passive Workers",
             "type": "string",
             "enum": ["1", "2"],
             "default": "1",
-            "description": "Parallel game downloads in passive mode."
+            "description": "Parallel game downloads in passive mode. Adaptive parallelism is off in passive mode; this is the exact number used."
           },
           "continuum.passiveDelayMs": {
             "title": "Passive Delay (ms)",
@@ -127,17 +147,23 @@
             "default": "750",
             "description": "Pause after each game in passive mode."
           },
-          "continuum.respectExtremeFilter": {
-            "title": "Respect Extreme Game Setting",
+          "continuum.respectFlashpointSettings": {
+            "title": "Respect Flashpoint Settings",
             "type": "boolean",
             "default": true,
-            "description": "Skip games the launcher hides with its extreme content filter."
+            "description": "Follow the launcher's own preferences: skip extreme-rated games when its extreme filter is on, request compressed images when it caches compressed images, and skip logos and screenshots when its image caching is off. Switch this off to ignore all three: no extreme filtering, images always uncompressed, and images cached even if the launcher's image caching is off. Turn image caching off in the launcher, with this switch on, to skip images; Continuum has no separate switch for that."
           },
-          "continuum.autoResume": {
-            "title": "Resume On Launcher Startup",
+          "continuum.autoMirror": {
+            "title": "Keep The Mirror Current Automatically",
             "type": "boolean",
             "default": false,
-            "description": "Continue an unfinished job when the launcher starts."
+            "description": "On launcher start, continue an unfinished job. While the launcher is open, rebuild the catalogue when its database changes and download only the games that rebuild changed. Start a fresh pass when something in scope is still missing and no job is saved. Automatic jobs run in passive mode; a resumed job keeps the mode you started it with. Replaces \"Resume On Launcher Startup\"."
+          },
+          "continuum.prioritizePlaylists": {
+            "title": "Playlist Games First",
+            "type": "boolean",
+            "default": false,
+            "description": "Pull games from your playlists to the front of the download queue. Everything is still downloaded; playlist games just arrive sooner. Checked while running: adding a game to a playlist moves it ahead of the remaining queue, and switching this off stops new moves without losing progress."
           }
         }
       }

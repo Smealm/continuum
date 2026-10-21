@@ -232,6 +232,7 @@ export class Catalog {
         );
       }
 
+      await keepPreviousCatalogue(this.paths.catalogFile, this.log);
       await fs.promises.rename(tempPath, this.paths.catalogFile);
 
       const scannedAt = new Date().toISOString();
@@ -291,4 +292,30 @@ export function errorMessage(error: unknown): string {
 
 export function catalogPathFor(paths: Paths): string {
   return path.resolve(paths.catalogFile);
+}
+
+/** Where the catalogue that a rebuild replaces is kept, for the diff report. */
+export function previousCatalogPath(catalogFile: string): string {
+  const suffix = '.jsonl';
+  return catalogFile.toLowerCase().endsWith(suffix)
+    ? `${catalogFile.slice(0, catalogFile.length - suffix.length)}.previous.jsonl`
+    : `${catalogFile}.previous`;
+}
+
+/**
+ * Move the current catalogue aside before the new one is renamed into place.
+ * The rebuild report reads it. Failing to keep it only costs that report, never
+ * the rebuild itself, so a failure is logged and ignored; a missing file means
+ * this is the first build and there is nothing to compare.
+ */
+export async function keepPreviousCatalogue(catalogFile: string, log?: Logger): Promise<boolean> {
+  try {
+    await fs.promises.rename(catalogFile, previousCatalogPath(catalogFile));
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log?.warn(`Could not keep the previous catalogue for the rebuild report: ${errorMessage(error)}`);
+    }
+    return false;
+  }
 }

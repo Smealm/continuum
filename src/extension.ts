@@ -4,18 +4,29 @@ import * as flashpoint from 'flashpoint-launcher';
 import { createApi } from './api';
 import type { ContinuumContext } from './context';
 import { ActivityTracker } from './core/activity';
+import { AUTO_CHECK_INTERVAL_MS, AutoDeps, runAutoTasks } from './core/auto';
 import { Catalog } from './core/catalog';
 import { getFreeBytes } from './core/disk';
 import { Engine, ProgressSink } from './core/engine';
+import { markInterruptedJob } from './core/jobstate';
 import { readJson } from './core/jsonl';
 import { resolveFlashpointRoot, resolvePaths } from './core/paths';
 import { FastCatalog } from './core/sqlite';
 import { JobState, Logger } from './core/types';
 import { showProgress } from './liveprogress';
-import { describeCatalogSource, openManager, scanCatalogue, startFlow } from './manager';
-import { readSettings } from './settings';
+import {
+  openManager,
+  rebuildCatalogueFlow,
+  reportCatalogueRebuild,
+  scanCatalogue,
+  startFlow,
+} from './manager';
+import { readConfiguredMode, readSettings } from './settings';
 
 let context: ContinuumContext | null = null;
+/** Checks the launcher database while the launcher is open, when auto is on. */
+let autoTimer: NodeJS.Timeout | null = null;
+let autoTickRunning = false;
 
 const logger: Logger = {
   debug: (message) => flashpoint.log.debug(`[Continuum] ${message}`),
@@ -23,6 +34,11 @@ const logger: Logger = {
   warn: (message) => flashpoint.log.warn(`[Continuum] ${message}`),
   error: (message) => flashpoint.log.error(`[Continuum] ${message}`),
 };
+
+function readConfigString(key: string): string {
+  const value = flashpoint.getExtConfigValue(key);
+  return typeof value === 'string' ? value.trim() : '';
+}
 
 export async function activate(extContext: flashpoint.ExtensionContext): Promise<void> {
   deactivate();
@@ -40,11 +56,15 @@ export async function activate(extContext: flashpoint.ExtensionContext): Promise
   }
 
   const catalog = new Catalog(api, paths, logger);
-  const sqliteCli = FastCatalog.findCli(flashpointRoot);
+  const sqliteCli = await FastCatalog.locate({
+    flashpointRoot,
+    configured: readConfigString('continuum.sqlitePath'),
+    log: logger,
+  });
   const fastCatalog = sqliteCli
     ? new FastCatalog({
       dbPath: paths.databaseFile,
-      cliPath: sqliteCli,
+      cliPath: sqliteCli.path,
       catalogFile: paths.catalogFile,
       catalogMetaFile: paths.catalogMetaFile,
       log: logger,
@@ -64,6 +84,8 @@ export async function activate(extContext: flashpoint.ExtensionContext): Promise
       const bytes = await probeFreeBytes(target);
       return bytes === null ? null : { freeBytes: bytes };
     },
+    // Live, so switching "Playlist Games First" takes effect without a restart.
+    readPrioritize: () => flashpoint.getExtConfigValue('continuum.prioritizePlaylists') === true,
   }, catalog);
 
   const ctx: ContinuumContext = {
@@ -78,14 +100,24 @@ export async function activate(extContext: flashpoint.ExtensionContext): Promise
     probeFreeBytes,
     readFastCatalogue: () => flashpoint.getExtConfigValue('continuum.fastCatalogue') !== false,
     readSettings: (mode) => readSettings(mode, (key) => flashpoint.getExtConfigValue(key)),
+    readMode: () => readConfiguredMode((key) => flashpoint.getExtConfigValue(key)),
   };
   context = ctx;
 
+  try {
+    if (await markInterruptedJob(paths.jobFile)) {
+      logger.warn('A previous download was interrupted. Its progress was kept and it can be resumed.');
+    }
+    await engine.loadState();
+  } catch (error) {
+    logger.warn(`Could not read the saved job state: ${errorMessage(error)}`);
+  }
+
   logger.info(`Loaded. Flashpoint folder: ${flashpointRoot}`);
   if (sqliteCli) {
-    logger.info(`Fast catalogue build available (${sqliteCli}).`);
+    logger.info(`Fast catalogue build available (sqlite ${sqliteCli.version} at ${sqliteCli.path}).`);
   } else {
-    logger.info('No sqlite3 tool found in the Flashpoint folder; catalogue rebuilds use the tag scan.');
+    logger.info('No working sqlite3 tool found in the Flashpoint folder or on PATH; catalogue rebuilds use the tag scan.');
   }
 
   const register = (disposable: flashpoint.Disposable): void => {
@@ -114,24 +146,9 @@ export async function activate(extContext: flashpoint.ExtensionContext): Promise
     }
   }));
   register(flashpoint.commands.registerCommand('continuum.status', guard(() => showProgress(ctx))));
-  register(flashpoint.commands.registerCommand('continuum.rescan', guard(async () => {
-    if (ctx.engine.isRunning()) {
-      await flashpoint.dialogs.showMessageBox({
-        message: 'Pause or stop the current download before rebuilding the catalogue.',
-        buttons: ['OK'],
-      });
-      return;
-    }
-    const choice = await flashpoint.dialogs.showMessageBox({
-      message: `Rebuild the catalogue now?\n\n${describeCatalogSource(ctx)}`,
-      buttons: ['Rebuild', 'Cancel'],
-      cancelId: 1,
-      largeMessage: true,
-    });
-    if (choice === 0) {
-      await scanCatalogue(ctx);
-    }
-  })));
+  // One rebuild path, so the settings button and the manager both get the
+  // confirmation and the comparison with the previous catalogue.
+  register(flashpoint.commands.registerCommand('continuum.rescan', guard(() => rebuildCatalogueFlow(ctx))));
   register(flashpoint.commands.registerCommand('continuum.reset', guard(async () => {
     const choice = await flashpoint.dialogs.showMessageBox({
       message: 'Reset saved download progress? Files already on disk are kept and skipped.',
@@ -155,12 +172,43 @@ export async function activate(extContext: flashpoint.ExtensionContext): Promise
       .catch((error) => logger.error(`Playlist mirror failed: ${errorMessage(error)}`));
   }));
 
+  // The user installed a game in the launcher while Continuum is running (or
+  // while it is paused): drop it from this run's queue and cancel our copy.
+  register(flashpoint.games.onDidInstallGameData((data) => {
+    if (data && data.gameId) {
+      ctx.engine.noteGameInstalled(data.gameId);
+    }
+  }));
+  register(flashpoint.games.onDidUninstallGameData((data) => {
+    if (data && data.gameId) {
+      ctx.engine.noteGameUninstalled(data.gameId);
+    }
+  }));
+
+  register(flashpoint.onExtConfigChange((change) => {
+    // Switching the master switch on should not wait for the next check.
+    if (change && change.key === 'continuum.autoMirror' && change.value === true) {
+      void runAuto(ctx);
+    }
+  }));
+
   register(flashpoint.onDidInit(() => {
-    void maybeAutoResume(ctx);
+    void runAuto(ctx);
+    if (!autoTimer) {
+      autoTimer = setInterval(() => {
+        void runAuto(ctx);
+      }, AUTO_CHECK_INTERVAL_MS);
+      // Never keep a closing launcher or a test process alive for this.
+      autoTimer.unref?.();
+    }
   }));
 }
 
 export function deactivate(): void {
+  if (autoTimer) {
+    clearInterval(autoTimer);
+    autoTimer = null;
+  }
   if (context) {
     context.engine.stop();
     context = null;
@@ -209,29 +257,45 @@ function createSink(): ProgressSink {
   };
 }
 
-async function maybeAutoResume(ctx: ContinuumContext): Promise<void> {
+/**
+ * The automatic tasks, as one check: rebuild when the launcher database moved,
+ * continue a saved job, handle the games a rebuild changed, or start a new
+ * pass when something is missing. See core/auto.ts for the decision itself.
+ */
+function autoDeps(ctx: ContinuumContext): AutoDeps {
+  return {
+    log: logger,
+    paths: ctx.paths,
+    readSettings: (mode) => ctx.readSettings(mode),
+    readDataVersion: () => flashpoint.dataVersion,
+    loadMeta: () => ctx.catalog.loadMeta(),
+    pendingChanges: (meta) => ctx.engine.pendingChanges(meta),
+    rebuild: async () => {
+      const meta = await scanCatalogue(ctx, { quiet: true });
+      if (!meta) {
+        return null;
+      }
+      const report = await reportCatalogueRebuild(ctx, meta);
+      return { meta, changed: report.changed };
+    },
+    prepare: (settings, options) => ctx.engine.prepare(settings, options),
+    start: (prep) => ctx.engine.start(prep),
+    isRunning: () => ctx.engine.isRunning(),
+    readJob: () => readJson<JobState>(ctx.paths.jobFile),
+  };
+}
+
+async function runAuto(ctx: ContinuumContext): Promise<void> {
+  if (autoTickRunning) {
+    return;
+  }
+  autoTickRunning = true;
   try {
-    if (ctx.engine.isRunning()) {
-      return;
-    }
-    const job = await readJson<JobState>(ctx.paths.jobFile);
-    if (!job || (job.status !== 'paused' && job.status !== 'stopped' && job.status !== 'running')) {
-      return;
-    }
-    const settings = ctx.readSettings(job.mode || 'passive');
-    if (!settings.autoResume) {
-      return;
-    }
-    const prep = await ctx.engine.prepare(settings);
-    if (prep.estimate.totalBytes <= 0) {
-      return;
-    }
-    const result = await ctx.engine.start(prep);
-    if (result.ok) {
-      ctx.log.info(`Auto-resumed the ${settings.mode} job (${job.status}).`);
-    }
+    await runAutoTasks(autoDeps(ctx));
   } catch (error) {
-    ctx.log.warn(`Could not auto-resume: ${errorMessage(error)}`);
+    logger.warn(`Automatic tasks failed: ${errorMessage(error)}`);
+  } finally {
+    autoTickRunning = false;
   }
 }
 
