@@ -333,6 +333,18 @@ The archive servers are shared infrastructure, and Continuum is a guest on them.
 - **The tag-union fallback is heavy** (thousands of API calls returning hydrated game objects, hours on a full catalogue). It only runs when the database read is unavailable or switched off.
 - **The measured peak is a lower bound.** The probe and the normal downloads only show what the link has delivered so far; a faster path discovered later raises the peak, and a slower one lowers it only after five minutes. A wall of tiny packs that is limited by requests per second rather than bytes will still be slower than the peak, which is exactly why the ETA uses the peak instead of the average. If in doubt, switch adaptive parallelism off and set the exact count. Passive mode remains one worker for a reason: a full mirror is 2.26 TB from shared archive infrastructure, and the default ceiling is deliberately modest.
 
+## Known bugs and what to do about them
+
+These are the reports that come up most often. None of them mean a damaged mirror, and none of the fixes below delete anything.
+
+**Some games fail to download.** Continuum downloads through the normal Flashpoint Infinity pipeline and treats the launcher database as the reference for what exists. An out-of-date or unclean database can point at archive files that have since been replaced or removed, so the pack fails even though the game is still listed. Fix it in this order: update the game metadata in Infinity, then run **Settings → Optimize Database** in the launcher, then rebuild Continuum's catalogue (**Rebuild Catalogue** on the config page, or **Catalogue → Rebuild catalogue** in the manager), and resume. The rebuild starts a fresh pass against the new catalogue, files already on disk are skipped, and a queued retry of the old pack is dropped once the host says it is gone.
+
+**Flashpoint slows the whole PC and my Wi-Fi down.** That is Continuum doing what it was asked to do: an automatic mirror started at launcher startup, at full speed. Press **Pause** in the manager, then turn **Keep The Mirror Current Automatically** off. If you still want progress in the background, switch **Download Mode** to `passive` and use the manager's Start button (or run **Start Passive Download**): one worker and a pause between games, meant to be left running for days. A maximum download speed setting is **not implemented yet**, so for now passive mode and the worker counts are the only throttle.
+
+**Progress or the manager takes a moment to appear.** This is a Flashpoint UI limitation, not a stuck extension. The menus carry a lot of buttons and fields, and the launcher renders the whole thing before it shows it on screen. Click once and wait; it opens.
+
+**Flashpoint is eating CPU and RAM and feels slow.** Probably the previous item: after clicking **Live progress** or the manager and seeing nothing, it is tempting to click again, and each click queues another menu. Every open progress window keeps updating its fields once a second, so twenty of them is expensive. Click **Back** — and keep clicking it when nothing seems to happen, because the queued dialogs close one at a time — then click the button once and wait. If the launcher is still heavy afterwards, pause the download.
+
 ## Notes
 
 `src/typings/flashpoint-launcher.d.ts` is the type definition file published by the Flashpoint Launcher project (MIT), used as described in the launcher's extension documentation.
