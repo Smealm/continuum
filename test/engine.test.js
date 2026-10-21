@@ -411,10 +411,12 @@ test('the next pass repairs the flag and resets the flag-failure counter', async
     const snapshot = engine.snapshot();
     assert.equal(snapshot.status, 'done');
     assert.equal(snapshot.job.packFlagsFailed, 0);
-    // The counter is cumulative (one pack from the first run), but this pass
-    // only repaired the flag: no new bytes were transferred.
-    assert.equal(snapshot.job.packsDone, 1);
+    // The first pass reached the end of the catalogue, so this is a fresh pass
+    // and its counters start again from zero. It only repaired the flag: no
+    // bytes were transferred and no pack was downloaded.
+    assert.equal(snapshot.job.packsDone, 0);
     assert.equal(snapshot.progress.sessionBytes, 0);
+    assert.equal(snapshot.progress.doneBytes, 0);
     assert.equal(api.games.get('game-1').gameData[0].presentOnDisk, true);
     assert.equal(api.games.get('game-1').gameData[0].path, filename);
   } finally {
@@ -629,7 +631,7 @@ test('smallest games first finishes more games sooner, in catalogue order on req
       api.prefs.gameDataSources = [{ type: 'raw', name: 'test', arguments: [`http://127.0.0.1:${server.port}/games/`] }];
       writeCatalogue(paths, catalogueFrom(games.map((entry) => entry.game)));
 
-      const engine = makeEngine(api, paths, { orderWindowSize: 500 });
+      const engine = makeEngine(api, paths, {});
       await engine.start(await engine.prepare(baseSettings({ includeImages: false, order })));
       await engine.whenIdle();
 
@@ -642,6 +644,164 @@ test('smallest games first finishes more games sooner, in catalogue order on req
     } finally {
       await server.close();
     }
+  }
+});
+
+test('smallest-first sorts the whole catalogue, not just the first few hundred games', async () => {
+  const { paths } = tempProject();
+  const total = 520;
+  const games = [];
+  for (let index = 1; index <= total; index += 1) {
+    const game = makeGame(index);
+    // Everything is the same size except the very last catalogue record, which
+    // is the smallest. The old 500-record window could not see it yet and would
+    // start with game-1 instead.
+    const size = index === total ? 1 : 1000;
+    const pack = Buffer.alloc(size, index % 250);
+    game.gameData[0].sha256 = sha256(pack);
+    game.gameData[0].size = pack.length;
+    games.push({ game, pack });
+  }
+
+  const requested = [];
+  const routes = {};
+  for (const { game, pack } of games) {
+    routes[`/games/${gameDataFilename(game.gameData[0])}`] = (request, response) => {
+      requested.push(game.id);
+      response.writeHead(200, { 'content-length': pack.length });
+      response.end(pack);
+    };
+  }
+  const server = await startServer(routes);
+
+  try {
+    const api = makeApi(games.map((entry) => entry.game));
+    api.prefs.gameDataSources = [{ type: 'raw', name: 'test', arguments: [`http://127.0.0.1:${server.port}/games/`] }];
+    writeCatalogue(paths, catalogueFrom(games.map((entry) => entry.game)));
+
+    const engine = makeEngine(api, paths);
+    await engine.start(await engine.prepare(baseSettings({ includeImages: false, order: 'smallest' })));
+    await engine.whenIdle();
+
+    assert.equal(requested.length, total);
+    assert.equal(requested[0], `game-${total}`, 'the smallest game anywhere in the catalogue goes first');
+    assert.equal(requested[requested.length - 1], 'game-519');
+    assert.equal(new Set(requested).size, total, 'every game is downloaded once');
+
+    const saved = JSON.parse(fs.readFileSync(paths.jobFile, 'utf8'));
+    assert.equal(saved.order.total, total);
+    assert.equal(saved.order.cursor, total, 'the queue position is saved');
+  } finally {
+    await server.close();
+  }
+});
+
+test('a saved smallest-first position resumes the queue where it stopped', async () => {
+  const { paths } = tempProject();
+  const sizes = [300, 10, 100];
+  const games = sizes.map((size, index) => {
+    const game = makeGame(index + 1);
+    const pack = Buffer.alloc(size, index + 1);
+    game.gameData[0].sha256 = sha256(pack);
+    game.gameData[0].size = pack.length;
+    return { game, pack };
+  });
+
+  const requested = [];
+  const routes = {};
+  for (const { game, pack } of games) {
+    routes[`/games/${gameDataFilename(game.gameData[0])}`] = (request, response) => {
+      requested.push(game.id);
+      response.writeHead(200, { 'content-length': pack.length });
+      response.end(pack);
+    };
+  }
+  const server = await startServer(routes);
+
+  try {
+    const api = makeApi(games.map((entry) => entry.game));
+    api.prefs.gameDataSources = [{ type: 'raw', name: 'test', arguments: [`http://127.0.0.1:${server.port}/games/`] }];
+    writeCatalogue(paths, catalogueFrom(games.map((entry) => entry.game)));
+
+    // A job that already finished the smallest game (game-2) and stopped.
+    fs.writeFileSync(paths.jobFile, JSON.stringify({
+      version: 1,
+      generation: 'gen-1',
+      scopeKey: 'all:|images=0',
+      mode: 'active',
+      cursor: 0,
+      bytes: 10,
+      packsDone: 1,
+      packsFailed: 0,
+      gamesDone: 1,
+      gamesFailed: 0,
+      imagesDone: 0,
+      status: 'stopped',
+      message: 'Stopped.',
+      updatedAt: new Date('2024-01-01T00:00:00.000Z').toISOString(),
+      order: { generation: 'gen-1', scopeKey: 'all:|images=0', cursor: 1, total: 3 },
+    }));
+
+    const engine = makeEngine(api, paths);
+    await engine.start(await engine.prepare(baseSettings({ includeImages: false, order: 'smallest' })));
+    await engine.whenIdle();
+
+    assert.deepEqual(requested, ['game-3', 'game-1'], 'the finished game is not downloaded again');
+  } finally {
+    await server.close();
+  }
+});
+
+test('a short probe warms the peak the ETA and worker count aim at', async () => {
+  const { paths } = tempProject();
+  const game = makeGame(1);
+  const pack = Buffer.from('probe-pack');
+  game.gameData[0].sha256 = sha256(pack);
+  // Large enough to be worth probing, even though the test body is short.
+  game.gameData[0].size = 20 * 1024 * 1024;
+  const filename = gameDataFilename(game.gameData[0]);
+
+  const server = await startServer({
+    [`/games/${filename}`]: (request, response) => {
+      response.writeHead(200, { 'content-length': pack.length });
+      response.end(pack);
+    },
+  });
+
+  try {
+    const api = makeApi([game]);
+    api.prefs.gameDataSources = [{ type: 'raw', name: 'test', arguments: [`http://127.0.0.1:${server.port}/games/`] }];
+    writeCatalogue(paths, catalogueFrom([game]));
+
+    const probed = [];
+    const engine = makeEngine(api, paths, {
+      probeSpeed: async (url) => {
+        probed.push(url);
+        return {
+          bytes: 30 * 1024 * 1024,
+          elapsedMs: 4000,
+          bytesPerSecond: 7_500_000,
+          stopped: 'plateau',
+        };
+      },
+    });
+
+    await engine.start(await engine.prepare(baseSettings({
+      includeImages: false,
+      order: 'smallest',
+      adaptiveWorkers: true,
+      activeWorkers: 4,
+    })));
+    assert.ok(await waitFor(() => probed.length === 1), 'the probe should run once at the start');
+    await engine.whenIdle();
+
+    assert.ok(probed[0].endsWith(filename), probed[0]);
+    assert.ok(
+      await waitFor(() => engine.snapshot().progress.peakBytesPerSecond >= 7_500_000),
+      `peak was ${engine.snapshot().progress.peakBytesPerSecond}`,
+    );
+  } finally {
+    await server.close();
   }
 });
 

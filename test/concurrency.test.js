@@ -32,18 +32,20 @@ test('climbs while more connections deliver more data, then stops at the ceiling
   assert.equal(seen[seen.length - 1], 8);
 });
 
-test('backs off when an extra connection lowers goodput', () => {
-  const { controller } = makeController({ start: 4 });
+test('backs off to the width that produced the peak when an extra connection lowers goodput', () => {
+  const { controller } = makeController({ start: 3 });
 
-  controller.sample({ bytes: 4000, failures: 0, elapsedMs: 1000 });
+  controller.sample({ bytes: 3000, failures: 0, elapsedMs: 1000 });
+  const raised = controller.sample({ bytes: 3600, failures: 0, elapsedMs: 1000 });
+  assert.equal(raised.limit, 4, 'a better rate earns one more worker');
+
   const worse = controller.sample({ bytes: 3000, failures: 0, elapsedMs: 1000 });
-
   assert.equal(worse.changed, true);
   assert.equal(worse.limit, 3);
   assert.match(worse.reason, /fell/);
 });
 
-test('a tiny dip holds instead of thrashing', () => {
+test('a rate near the measured peak holds instead of thrashing', () => {
   const { controller } = makeController({ start: 4 });
 
   controller.sample({ bytes: 4000, failures: 0, elapsedMs: 1000 });
@@ -51,7 +53,36 @@ test('a tiny dip holds instead of thrashing', () => {
 
   assert.equal(steady.changed, false);
   assert.equal(steady.limit, 4);
-  assert.match(steady.reason, /holding/);
+  assert.match(steady.reason, /peak/);
+});
+
+test('climbs towards a peak measured by a probe, doubling while far below it', () => {
+  const { controller } = makeController({ start: 2, max: 20 });
+
+  controller.observePeak(8_000_000);
+
+  const first = controller.sample({ bytes: 1_000_000, failures: 0, elapsedMs: 1000 });
+  assert.equal(first.changed, true);
+  assert.equal(first.limit, 4, '2 MB/s against an 8 MB/s peak doubles the width');
+  assert.match(first.reason, /peak/);
+
+  const second = controller.sample({ bytes: 3_500_000, failures: 0, elapsedMs: 1000 });
+  assert.equal(second.limit, 8);
+
+  const pressed = controller.sample({ bytes: 7_500_000, failures: 0, elapsedMs: 1000 });
+  assert.equal(pressed.changed, false, 'within 10% of the peak the link is considered pressed');
+  assert.equal(pressed.limit, 8);
+  assert.match(pressed.reason, /peak/);
+});
+
+test('stays at the ceiling through a wall of small files below the probe peak', () => {
+  const { controller } = makeController({ start: 2, max: 4 });
+
+  controller.observePeak(8_000_000);
+  for (let step = 0; step < 6; step += 1) {
+    const decision = controller.sample({ bytes: 500_000, failures: 0, elapsedMs: 1000 });
+    assert.equal(decision.limit, 4, 'the width stays at the ceiling the user configured');
+  }
 });
 
 test('server failures halve the width and pause probing upwards', () => {

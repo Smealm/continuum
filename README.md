@@ -126,21 +126,21 @@ Continuum and the launcher can work on the same library at the same time.
 **Check Ongoing Progress** (Config page) opens a window that updates once a second:
 
 - **Catalogue rebuild** — current tag, games and packs found, elapsed time, ETA and a progress bar.
-- **Download** — the game being fetched, games/packs/bytes so far, failures, speed, ETA, free space and a progress bar.
+- **Download** — the game being fetched, games/packs/bytes so far, failures, current speed, the best speed the link has shown, ETA, free space and a progress bar. The ETA is computed from that measured peak and from the best game and pack rates, not from the average since the job started, so the first minutes of small packs no longer inflate it.
 - **Idle** — the last action, catalogue totals, missing size and free space.
 
 **Back** only closes the window; the rebuild or download keeps running in the background, and the same view can be reopened from the button or from **Live progress** in the Continuum Manager. The launcher's task bar also shows a progress entry while a job is active.
 
 ### Modes
 
-- **Active** — up to the configured ceiling (4 by default, 20 maximum), with no artificial delay and no CPU or RAM throttling. With **Adaptive Parallelism** on it starts at two transfers and grows only while more connections actually deliver more data. Intended for a focused download.
+- **Active** — up to the configured ceiling (4 by default, 20 maximum), with no artificial delay and no CPU or RAM throttling. With **Adaptive Parallelism** on it starts at two transfers and raises the count until the download is pressing the best speed the connection has shown. Intended for a focused download.
 - **Passive** — exactly 1 worker and a pause between games. Intended to run in the background for days.
 
 Both modes use the same engine; only concurrency and pacing differ. Downloads are network-bound, so passive mode mostly reduces burst load on the archive servers rather than CPU.
 
 ### Download order: smallest games first
 
-The archive's sizes are heavily skewed: 206,796 packs average 11.2 MB, but the median pack is around 1.7 MB and a few dozen are tens of gigabytes. Downloading in catalogue order therefore spends the first hour on whatever happens to come first. **Download Order: smallest** (the default) keeps a 500-record look-ahead window and always takes the cheapest remaining game from it:
+The archive's sizes are heavily skewed: 206,796 packs average 11.2 MB, but the median pack is around 1.7 MB and a few dozen are tens of gigabytes. Downloading in catalogue order therefore spends the first hour on whatever happens to come first. **Download Order: smallest** (the default) sorts the whole catalogue by remaining bytes at the start of the pass and works through it from the cheapest game to the most expensive:
 
 | Link speed | Games finished in the first hour, catalogue order | Smallest first | Ratio |
 |---|---|---|---|
@@ -151,7 +151,7 @@ The archive's sizes are heavily skewed: 206,796 packs average 11.2 MB, but the m
 
 Measured by simulating a catalogue calibrated to the reference archive (206,796 packs, mean 10.4 MB, median 1.7 MB, one pack per game) byte-for-byte at each link speed. The total mirror time does not change: every game is still downloaded, the big ones simply arrive last. Playlist priority is applied first, so the ordering happens inside the priority queue; a game whose packs are mostly on disk scores cheap and moves ahead.
 
-The window is the safety mechanism. Memory stays at 500 records instead of 221k, and the saved cursor is held at the start of the earliest game the window has not handed out, so a force close re-reads at most one window (a few milliseconds) and never skips a game. Ties keep catalogue order, so the same catalogue always produces the same sequence. **Download Order: catalogue** restores the old byte-cursor order.
+The sort reads the catalogue once and stores only each game's byte offset and remaining size (a few megabytes for the full archive, not the records themselves), so the order genuinely spans all 221k games. Games are then read by seeking, in size order. The saved position is an index into that sorted list, and it is only advanced past games that finished: anything handed to a worker but not done stays behind it, so a stop or crash retries those games instead of skipping them. Ties keep catalogue order, and the same catalogue generation always produces the same list, which is what makes a saved index meaningful. **Download Order: catalogue** keeps the old byte-cursor order.
 
 ### Parallel downloads
 
@@ -165,7 +165,9 @@ More connections only help when the bottleneck is per connection — request lat
 |---|---|---|---|---|---|
 | Throughput | 2.9 MB/s | 3.1 | 3.1 | 3.1 | 3.1 |
 
-Both measured against a local HTTP server with Continuum's own download path. That is why the controller is adaptive rather than `file size -> thread count`: it samples goodput every 15 seconds, climbs one worker while the sample improves by more than 5%, holds while it is steady, steps back when it falls by more than 15%, and halves the width on failures before a 60-second cooldown. **Active Workers** is the hard ceiling, so the archive never sees more than one client's configured maximum. Adaptive parallelism is off in passive mode and for changed-only passes, where the worker count is the exact number configured.
+Both measured against a local HTTP server with Continuum's own download path. That is why the controller is adaptive rather than `file size -> thread count`: it aims at a rate, not at a fixed number of connections. Every five seconds it compares goodput with the best sustained rate it has seen (and with a rate measured by the probe below) and adds workers while the download is more than 10% below that peak, doubling the width when it is less than half. Within 10% of the peak it holds: the link is being pressed. It steps back when a wider width delivers less than 85% of the peak, and halves on failures before a 60-second cooldown. **Active Workers** is the hard ceiling, so the archive never sees more than one client's configured maximum. Adaptive parallelism is off in passive mode and for changed-only passes, where the worker count is the exact number configured.
+
+To know what the connection can do before the queue reaches a large game, adaptive active jobs run **one short probe at the start of a job, at most once an hour**. It is a real pack the job still needs, read for at most 30 seconds and stopped as soon as the rate plateaus; the bytes are discarded, never written to the target drive. What the probe measures plus what the real workers were getting at the same time is the ceiling the worker count aims for — and the rate the ETA uses. Nothing is downloaded twice: the probed pack is still downloaded normally when its turn comes.
 
 **Download Mode** picks which one the manager's single Start button uses. The **Start Active** and **Start Passive** buttons on the config page, **Mirror with Continuum**, and a resumed job choose explicitly and are not affected by the setting.
 
@@ -181,8 +183,8 @@ Both measured against a local HTTP server with Continuum's own download path. Th
 | Keep Free Disk Space (GB) | 5 | Pause before free space drops below this |
 | Download Limit (GB) | 0 | Stop after this much in one job (0 = unlimited) |
 | Active Workers | 4 | Ceiling for parallel games in active mode (up to 20) |
-| Adaptive Parallelism | on | Use as many connections as actually deliver more data, up to the ceiling |
-| Download Order | `smallest` | Smallest remaining games first, or `catalogue` order |
+| Adaptive Parallelism | on | Aim the worker count at the best measured speed, up to the ceiling (one 30 s probe per hour) |
+| Download Order | `smallest` | Whole-catalogue smallest remaining first, or `catalogue` order |
 | Passive Workers | 1 | Parallel games in passive mode (exact count) |
 | Passive Delay (ms) | 750 | Pause after each game in passive mode |
 | Respect Flashpoint Settings | on | Follow the launcher's extreme rating, compressed images and image caching |
@@ -220,7 +222,7 @@ Free-space detection uses `fs.statfs` on newer runtimes, and falls back to Power
 
 ## Resume model
 
-`state/catalog.jsonl` is a one-record-per-line snapshot. The engine streams it and stores a byte cursor after every game. The cursor is held at the **start of the earliest in-flight game** (and, with smallest-first ordering, at the earliest game the look-ahead window has not handed out), so a stop mid-game retries that game instead of skipping it. A game the byte limit or disk guard prevented from starting is pinned the same way, so it is not lost by the pause either. Re-processing is safe: existing files are skipped and database flags are repaired.
+`state/catalog.jsonl` is a one-record-per-line snapshot. In catalogue order the engine streams it and stores a byte cursor after every game, held at the **start of the earliest in-flight game**; in smallest-first order it stores the position in the sorted queue instead (`job.order.cursor`), held at the **first game not yet finished**. Either way a stop mid-game retries that game instead of skipping it, and a game the byte limit or disk guard prevented from starting is pinned the same way. Re-processing is safe: existing files are skipped and database flags are repaired.
 
 State files live in the extension folder:
 
@@ -306,8 +308,11 @@ The archive servers are shared infrastructure, and Continuum is a guest on them.
   ceiling) avoid a TCP and TLS handshake for every small pack, which reduces load
   on the server as much as it speeds up the client.
 - **Concurrency is capped and measured.** Passive mode uses one worker, active
-  mode never exceeds the configured ceiling, and adaptive parallelism backs off
-  when goodput falls rather than hammering a saturated or shaped link.
+  mode never exceeds the configured ceiling, and adaptive parallelism stops
+  adding workers once the measured link speed is reached rather than hammering a
+  saturated or shaped link. Its hourly probe reads one pack for at most 30
+  seconds and keeps none of it: that is one large pack's worth of traffic per
+  hour, not a second copy of the archive.
 
 ## What Continuum deliberately does not do
 
@@ -326,7 +331,7 @@ The archive servers are shared infrastructure, and Continuum is a guest on them.
 - **Changing the extreme filter mid-job takes effect on the next pass.** The image decision is part of the saved scope key, so toggling the launcher's image caching (while Respect is on) starts a fresh pass immediately; the extreme filter is applied per game, so a resumed job keeps its place and fetches the newly included games when the pass restarts (files already on disk are skipped).
 - **No mid-file resume.** Interrupted packs restart; packs are small on average, so this is cheaper than maintaining partial state.
 - **The tag-union fallback is heavy** (thousands of API calls returning hydrated game objects, hours on a full catalogue). It only runs when the database read is unavailable or switched off.
-- **Adaptive parallelism can only see aggregate goodput.** It settles when adding a connection stops helping, not when a particular file is unusually slow; a shape that changes mid-run is re-probed after the next sample. If in doubt, switch it off and set the exact count. Passive mode remains one worker for a reason: a full mirror is 2.26 TB from shared archive infrastructure, and the default ceiling is deliberately modest.
+- **The measured peak is a lower bound.** The probe and the normal downloads only show what the link has delivered so far; a faster path discovered later raises the peak, and a slower one lowers it only after five minutes. A wall of tiny packs that is limited by requests per second rather than bytes will still be slower than the peak, which is exactly why the ETA uses the peak instead of the average. If in doubt, switch adaptive parallelism off and set the exact count. Passive mode remains one worker for a reason: a full mirror is 2.26 TB from shared archive infrastructure, and the default ceiling is deliberately modest.
 
 ## Notes
 
@@ -352,9 +357,10 @@ src/
     maintenance.ts    stale .part sweep
     jobstate.ts       interrupted-job detection at startup
     reconcile.ts      rebuild diff and old-pack cleanup (scan + guarded delete)
-    download.ts       redirect-aware HTTP download, keep-alive, SHA-256, Retry-After
-    concurrency.ts    adaptive goodput controller and the working-width gate
-    window.ts         bounded smallest-first look-ahead over the catalogue
+    download.ts       redirect-aware HTTP download, keep-alive, SHA-256, Retry-After, speed probe
+    concurrency.ts    peak-seeking worker controller and the working-width gate
+    bandwidth.ts      sustained peak/current rate meter behind the ETA
+    order.ts          whole-catalogue smallest-first queue and its saved position
     permission.ts     the persisted 401/403 refusal marker
     disk.ts           free-space probing with Node 16 fallback
     jsonl.ts          resumable JSONL cursor
@@ -371,12 +377,14 @@ test/                 node:test suites (HTTP server, fake API, temp folders)
 npm test
 ```
 
-204 tests cover:
+221 tests cover:
 
 - filename derivation, including the 113 real cached packs on the reference install (all matched)
 - streaming downloads: hashes, mismatches, redirects, 404, abort, `.part` cleanup, the Continuum User-Agent, connection reuse, `Retry-After` parsing and 401/403 classification, plus a measured latency-bound comparison (8 connections finish well under half the time of one)
-- the adaptive controller: climbing while goodput improves, holding on a small dip, backing off on a fall, halving on failures with a cooldown, floor and ceiling, and a zero-length sample; the work gate's width changes and cancellation
-- the smallest-first window: bounded look-ahead, ties in catalogue order, the earliest-waiting offset used for a safe resume, an empty catalogue, and resuming from that offset
+- the adaptive controller: climbing while goodput improves, doubling towards a measured peak, holding within 10% of it, backing off to the width that produced it, halving on failures with a cooldown, floor and ceiling, and a zero-length sample; the work gate's width changes and cancellation
+- the speed probe: a plateau stop, a hard time cap, a 404 and an abort
+- the bandwidth meter: the sustained peak surviving a wall of small files, a probe rate, the five-minute slow-phase relearn, and a reset
+- the smallest-first queue: a whole-catalogue sort (the smallest game 519 records in still goes first), ties in catalogue order, games with only images left, scope filtering, and resuming from the saved queue position without repeating a finished game
 - a refusal: recorded and read back, junk ignored, the engine stopping after one 403 with no retry and no failed-pack count, automatic tasks pausing until cleared, and the manager asking before trying again
 - JSONL cursor offsets and resume across chunk boundaries
 - catalogue tag-union, de-duplication, abort safety
@@ -399,7 +407,7 @@ npm test
 - a queued retry being cancelled when the launcher installs the game mid-transfer, and concurrent retry saves persisting every entry
 - loading the compiled extension itself against a mocked `flashpoint-launcher` module, then running the full command flow (scan → confirm → download → database writes)
 - catalogue activity tracking (start, updates, finish, failure, clamping)
-- progress views for rebuilds, downloads, pauses and idle state, including ETA and elapsed formatting
+- progress views for rebuilds, downloads, pauses and idle state, including ETA and elapsed formatting, the peak-aware ETA on a resumed job, and the pack/game-rate floor for a queue of tiny packs
 - the live dialog opening with four fields and updating them, plus the idle fallback
 - the fast catalogue build: sqlite3 discovery (Windows/macOS/Linux layouts, an explicit path, then PATH), version probing and the session cache, restoring a missing execute bit, hex decoding, tag/platform/pack assembly, source selection, and refusing to overwrite a good catalogue on a bad schema, a failed CLI or a cancelled read
 - the manager choosing between the database build and the tag scan, including the fallback dialog and a cancelled read not restarting the slow scan

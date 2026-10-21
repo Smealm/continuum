@@ -12,6 +12,7 @@ const {
   isNotFound,
   isPermissionDenied,
   parseRetryAfter,
+  probeDownloadSpeed,
   retryAfterMsOf,
 } = require('../dist/core/download.js');
 const { sha256, startServer } = require('./helpers.js');
@@ -233,6 +234,111 @@ test('parallel downloads beat a single connection when latency dominates', async
     const serial = await run(1);
     const parallel = await run(8);
     assert.ok(parallel < serial / 2, `expected 8 connections (${parallel}ms) to finish well under half of 1 (${serial}ms)`);
+  } finally {
+    closeDownloadConnections();
+    await server.close();
+  }
+});
+
+test('probes the rate of a large transfer and stops when it plateaus', async () => {
+  let written = 0;
+  const server = await startServer({
+    '/huge': (request, response) => {
+      response.writeHead(200, { 'content-length': 10 * 1024 * 1024 * 1024 });
+      const chunk = Buffer.alloc(64 * 1024);
+      const timer = setInterval(() => {
+        if (response.writableEnded) {
+          return;
+        }
+        response.write(chunk);
+        written += chunk.length;
+      }, 5);
+      request.on('close', () => clearInterval(timer));
+    },
+  });
+  try {
+    const started = Date.now();
+    const result = await probeDownloadSpeed(`http://127.0.0.1:${server.port}/huge`, {
+      maxMs: 4000,
+      plateauMs: 300,
+    });
+    const elapsed = Date.now() - started;
+
+    assert.equal(result.stopped, 'plateau');
+    assert.ok(result.bytes > 0, 'the probe read data');
+    assert.ok(result.bytesPerSecond > 0);
+    assert.ok(elapsed < 4000, `the probe stopped early (${elapsed}ms)`);
+    assert.ok(written < 10 * 1024 * 1024 * 1024, 'the whole file was not downloaded');
+  } finally {
+    closeDownloadConnections();
+    await server.close();
+  }
+});
+
+test('a probe stops at its time limit when the rate has not settled', async () => {
+  const server = await startServer({
+    '/huge': (request, response) => {
+      response.writeHead(200, { 'content-length': 10 * 1024 * 1024 * 1024 });
+      const chunk = Buffer.alloc(48 * 1024);
+      const timer = setInterval(() => {
+        if (!response.writableEnded) {
+          response.write(chunk);
+        }
+      }, 5);
+      request.on('close', () => clearInterval(timer));
+    },
+  });
+  try {
+    const started = Date.now();
+    const result = await probeDownloadSpeed(`http://127.0.0.1:${server.port}/huge`, {
+      maxMs: 800,
+      // A limit that cannot fire before maxMs, so only the time cap can stop it.
+      plateauMs: 60_000,
+    });
+    const elapsed = Date.now() - started;
+
+    assert.equal(result.stopped, 'time');
+    assert.ok(result.bytes > 0);
+    assert.ok(elapsed >= 700 && elapsed < 3000, `stopped at the limit (${elapsed}ms)`);
+  } finally {
+    closeDownloadConnections();
+    await server.close();
+  }
+});
+
+test('a probe that hits a 404 fails like a normal download', async () => {
+  const server = await startServer({});
+  try {
+    await assert.rejects(
+      probeDownloadSpeed(`http://127.0.0.1:${server.port}/missing`, { maxMs: 1000 }),
+      (error) => isNotFound(error),
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test('a probe can be aborted', async () => {
+  const server = await startServer({
+    '/huge': (request, response) => {
+      response.writeHead(200, { 'content-length': 10 * 1024 * 1024 * 1024 });
+      const timer = setInterval(() => {
+        if (!response.writableEnded) {
+          response.write(Buffer.alloc(1024));
+        }
+      }, 5);
+      request.on('close', () => clearInterval(timer));
+    },
+  });
+  try {
+    const controller = new AbortController();
+    const pending = probeDownloadSpeed(`http://127.0.0.1:${server.port}/huge`, {
+      signal: controller.signal,
+      maxMs: 30_000,
+      plateauMs: 60_000,
+    });
+    setTimeout(() => controller.abort(), 50);
+    await assert.rejects(pending, /aborted/i);
   } finally {
     closeDownloadConnections();
     await server.close();

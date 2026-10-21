@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.4.1 — 2026-10-21
+
+### Fixed
+
+- **The ETA no longer assumes the small-file wall is the whole job.** It used to
+  divide the remaining bytes by the average speed since the job started. With
+  smallest-first ordering that average is set by the opening minutes of 120 KB
+  packs, so a 6-hour job was quoted as 12 hours even though the link does 5–10
+  MB/s once real packs are in flight. The engine now keeps the best **sustained**
+  rate it has seen (a three-second sample, so a burst cannot inflate it) plus the
+  best pack and game completion rates, and the ETA is the longest of the three:
+  remaining bytes at the peak, remaining packs at the pack rate, and remaining
+  games at the game rate. A resumed job also counts the bytes it already
+  handled; previously its estimate restarted at zero and doubled the remaining
+  work.
+- **Smallest-first now sorts the whole catalogue.** The old 500-record
+  look-ahead only ordered the next 500 games, so after the first batch the queue
+  fell back to catalogue order and a worker could be handed a large game while
+  smaller ones were still waiting. The pass now reads the catalogue once, sorts
+  every in-scope game by remaining bytes, and seeks through the resulting queue;
+  the saved position is an index into it, held at the first game that has not
+  finished. Games with only logos or screenshots left sort first, ties keep
+  catalogue order, and the order is deterministic for a catalogue generation.
+- **Adaptive parallelism aims at the measured peak instead of stopping at the
+  first small gain.** It samples every five seconds (was 15) and adds workers
+  while goodput is more than 10% below the best rate it has seen, doubling the
+  width when it is more than half below, so a wall of small packs no longer
+  leaves most of the link idle. A wider width that delivers less than 85% of the
+  peak is dropped at once; a shortfall at the width that produced the peak is
+  held for 15 seconds before the peak is relearned instead of thrashing.
+
+### Added
+
+- **A 30-second speed probe warms up the peak.** Adaptive active jobs read one
+  large pack the job still needs — at most once an hour — until the rate
+  plateaus or 30 seconds pass, keep none of the bytes, and use the measured rate
+  plus what the real workers were getting at the same time as the link ceiling.
+  This gives the ETA and the worker count a target before the queue reaches a
+  large game. The probed pack is still downloaded normally when its turn comes,
+  and the probe is never written to the target drive.
+
+### Changed
+
+- The live progress view shows the current speed, the measured peak when it is
+  higher, and an ETA based on the peak; the timing line is now understandable
+  next to a queue of small games.
+- A job that reached the end of a pass starts the next pass with its byte, pack
+  and queue counters at zero, so a second pass no longer opens at 100% done with
+  no ETA.
+
 ## 0.4.0 — 2026-10-21
 
 ### Added

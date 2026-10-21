@@ -57,8 +57,27 @@ export function buildProgressView(input: ProgressInput): ProgressView {
     const elapsedEnd = running ? now : Date.parse(job.updatedAt) || now;
     const elapsed = engine.startedAt ? Math.max(0, elapsedEnd - engine.startedAt) : 0;
     const seconds = elapsed / 1000;
-    const speed = seconds > 0 ? engine.progress.sessionBytes / seconds : 0;
-    const remaining = Math.max(0, engine.progress.estimateBytes - engine.progress.sessionBytes);
+    const doneBytes = engine.progress.doneBytes ?? engine.progress.sessionBytes;
+    const remaining = engine.progress.remainingBytes
+      ?? Math.max(0, engine.progress.estimateBytes - doneBytes);
+    // The average since the job started is skewed by the first minutes of a
+    // smallest-first queue, so the ETA uses the best sustained rate the link
+    // has shown. The current rate is what the user is watching right now.
+    const current = engine.progress.currentBytesPerSecond ?? 0;
+    const lifetime = seconds > 0 ? engine.progress.sessionBytes / seconds : 0;
+    const speed = current > 0 ? current : lifetime;
+    const peak = engine.progress.peakBytesPerSecond ?? 0;
+    const peakPacks = engine.progress.peakPacksPerSecond ?? 0;
+    const peakGames = engine.progress.peakGamesPerSecond ?? 0;
+    const remainingPacks = engine.progress.remainingPacks ?? 0;
+    const remainingGames = engine.progress.remainingGames ?? 0;
+    const rate = peak > 0 ? peak : speed;
+    const byteSeconds = remaining > 0 && rate > 0 ? remaining / rate : 0;
+    const packSeconds = peakPacks > 0 ? remainingPacks / peakPacks : 0;
+    const gameSeconds = peakGames > 0 ? remainingGames / peakGames : 0;
+    // Whichever runs out last: bytes at the measured link speed, or the queue
+    // of small games at the fastest rate it has ever finished them.
+    const etaSeconds = Math.max(byteSeconds, packSeconds, gameSeconds);
     const activity = engine.live
       ? `${engine.live.gameTitle}${engine.live.received > 0
         ? ` (${formatBytes(engine.live.received)}${engine.live.total ? ` / ${formatBytes(engine.live.total)}` : ''})`
@@ -70,7 +89,7 @@ export function buildProgressView(input: ProgressInput): ProgressView {
     const stats = [
       `${formatCount(job.gamesDone)} games`,
       `${formatCount(job.packsDone)} packs`,
-      formatBytes(engine.progress.sessionBytes),
+      formatBytes(doneBytes),
       job.packsFailed > 0 ? `${formatCount(job.packsFailed)} failed` : '',
       (job.packFlagsFailed ?? 0) > 0 ? `${formatCount(job.packFlagsFailed!)} flags pending` : '',
       job.priority && job.priority.ids.length > 0
@@ -81,7 +100,8 @@ export function buildProgressView(input: ProgressInput): ProgressView {
     const timing = [
       elapsed > 0 ? `Elapsed ${formatDuration(elapsed)}` : '',
       speed > 0 ? `${formatBytes(speed)}/s` : '',
-      speed > 0 && remaining > 0 ? `ETA ${formatDuration((remaining / speed) * 1000)}` : '',
+      peak > 0 && (speed <= 0 || peak > speed * 1.25) ? `peak ${formatBytes(peak)}/s` : '',
+      etaSeconds > 0 ? `ETA ${formatDuration(etaSeconds * 1000)}` : '',
       engine.retryPending > 0 ? `${formatCount(engine.retryPending)} queued for retry` : '',
       freeBytes !== null ? `${formatBytes(freeBytes)} free` : '',
     ].filter(Boolean).join(' · ');
@@ -147,7 +167,7 @@ function idleView(
     percent: 0,
     activity: finished ? 'Finished' : scanFinished ? 'Catalogue rebuilt' : '',
     stats: finished && job
-      ? `${formatCount(job.gamesDone)} games · ${formatCount(job.packsDone)} packs · ${formatBytes(engine.progress.sessionBytes)}`
+      ? `${formatCount(job.gamesDone)} games · ${formatCount(job.packsDone)} packs · ${formatBytes(engine.progress.doneBytes ?? engine.progress.sessionBytes)}`
       : scanFinished
         ? scan.outcome || ''
         : '',

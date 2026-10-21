@@ -1,17 +1,26 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { BandwidthMeter } from './bandwidth';
 import { Catalog, CatalogGameRecord, CatalogMeta, errorMessage } from './catalog';
 import { ConcurrencyController, WorkGate } from './concurrency';
 import { DbWriteQueue } from './dbqueue';
 import { getFreeBytes } from './disk';
-import { fetchToFile, HttpStatusError, isNotFound, isPermissionDenied, retryAfterMsOf } from './download';
+import {
+  fetchToFile,
+  HttpStatusError,
+  isNotFound,
+  isPermissionDenied,
+  probeDownloadSpeed,
+  retryAfterMsOf,
+  SpeedProbeResult,
+} from './download';
 import { formatBytes, formatCount, formatPercent, gameDataFilename, joinUrl } from './format';
 import { JsonlCursor, appendJsonl, readJson, writeJsonAtomic } from './jsonl';
 import { sweepPartFiles } from './maintenance';
+import { buildDownloadOrder, OrderEntry } from './order';
 import { recordDenial } from './permission';
 import { RetryEntry, RetryInput, RetryStore } from './retry';
 import { matchesScope, scopeKey, ScopeFilter } from './scope';
-import { GameWindow } from './window';
 import {
   ChangedEntry,
   ChangedList,
@@ -48,10 +57,10 @@ export interface EngineDeps {
   readPrioritize?: () => boolean;
   /** How often to re-read playlists while the priority queue is empty. */
   priorityRefreshMs?: number;
-  /** How many catalogue records the smallest-first window holds. */
-  orderWindowSize?: number;
   /** How often the adaptive controller samples the transfer rate. */
   adaptIntervalMs?: number;
+  /** Injected for tests; measures one file without keeping it. */
+  probeSpeed?: (url: string, options: { signal?: AbortSignal; maxMs?: number }) => Promise<SpeedProbeResult>;
 }
 
 export interface Estimate {
@@ -92,6 +101,8 @@ interface WorkItem {
   priority: boolean;
   /** Position in the changed list, so a stop can pin it for the next run. */
   changedIndex?: number;
+  /** Position in the smallest-first order, for the saved queue position. */
+  orderIndex?: number;
 }
 
 interface PriorityPlan {
@@ -116,7 +127,23 @@ export interface EngineSnapshot {
   meta: CatalogMeta | null;
   live: LiveProgress | null;
   settings: Settings | null;
-  progress: { sessionBytes: number; estimateBytes: number; percent: number };
+  progress: {
+    /** Bytes this run, for the "progress so far" line of a single session. */
+    sessionBytes: number;
+    /** Bytes handled for the whole job, including earlier runs. */
+    doneBytes: number;
+    estimateBytes: number;
+    percent: number;
+    remainingBytes: number;
+    remainingPacks: number;
+    remainingGames: number;
+    /** Best sustained rate seen, used for the ETA instead of the average. */
+    peakBytesPerSecond: number;
+    currentBytesPerSecond: number;
+    /** Best sustained completion rates, the floor under the ETA. */
+    peakPacksPerSecond: number;
+    peakGamesPerSecond: number;
+  };
   startedAt: number | null;
   /** Downloads waiting in the retry queue. */
   retryPending: number;
@@ -131,14 +158,26 @@ interface StartResult {
 
 const PERSIST_INTERVAL_MS = 2000;
 const TASK_INTERVAL_MS = 1000;
+/** How often the progress meter records a rate sample. */
+export const RATE_SAMPLE_MS = 1000;
 /**
- * How far the smallest-first reorder looks ahead. The saved cursor never moves
- * past the earliest game still in this window, so a force close loses at most
- * one window of scan work (a few milliseconds).
+ * How often the adaptive controller compares goodput. Five seconds keeps the
+ * ramp to the measured peak short without turning the log into a stream.
  */
-export const ORDER_WINDOW_SIZE = 500;
-/** How often the adaptive controller compares goodput. */
-export const ADAPT_INTERVAL_MS = 15_000;
+export const ADAPT_INTERVAL_MS = 5_000;
+/**
+ * A pack this large gives the probe a real transfer to watch. Smaller files are
+ * dominated by request latency and say nothing about the link.
+ */
+const PEAK_PROBE_MIN_BYTES = 16 * 1024 * 1024;
+/** Above this, a pack is big enough; no need to scan further for a larger one. */
+const PEAK_PROBE_GOOD_BYTES = 256 * 1024 * 1024;
+/** Give up looking for a big pending pack after this many catalogue records. */
+const PEAK_PROBE_SCAN_RECORDS = 20_000;
+/** The probe is short on purpose: 30 seconds at full speed, then it stops. */
+const PEAK_PROBE_MAX_MS = 30_000;
+/** Never probe more than once an hour. */
+const PEAK_PROBE_INTERVAL_MS = 60 * 60_000;
 /** How long a finished pass waits for the retry queue before giving up for now. */
 const RETRY_WAIT_LIMIT_MS = 2 * 60_000;
 /** How often a running job re-reads playlists for new priority games. */
@@ -197,8 +236,25 @@ export class Engine {
   /** gameId -> controller for the transfer running now, so it can be cancelled. */
   private inflightDownloads = new Map<string, AbortController>();
   private changedOnly = false;
-  /** Smallest-first look-ahead over the catalogue; null in catalogue order. */
-  private window: GameWindow<CatalogGameRecord> | null = null;
+  /**
+   * Whole-catalogue order for smallest-first runs, or null in catalogue order.
+   * The saved position is an index into this list, not a byte offset.
+   */
+  private orderEntries: OrderEntry[] | null = null;
+  private orderIndex = 0;
+  private orderCursor: JsonlCursor<CatalogGameRecord> | null = null;
+  /** Order positions handed out but not finished; a stop rewinds to the first. */
+  private inflightOrder = new Set<number>();
+  private orderCache: { key: string; entries: OrderEntry[] } | null = null;
+  private readonly meter = new BandwidthMeter();
+  private rateSampledBytes = 0;
+  private rateSampledPacks = 0;
+  private rateSampledGames = 0;
+  private rateSampledAt = 0;
+  private rateTimer: NodeJS.Timeout | null = null;
+  private probeAbort: AbortController | null = null;
+  private lastPeakProbeAt = 0;
+  private catalogSize = 0;
   private gate: WorkGate | null = null;
   private controller: ConcurrencyController | null = null;
   private workerCeiling = 0;
@@ -238,11 +294,16 @@ export class Engine {
   snapshot(): EngineSnapshot {
     const sessionBytes = this.job ? Math.max(0, this.job.bytes - this.sessionStartBytes) : 0;
     const estimateBytes = this.estimate?.totalBytes ?? 0;
+    // A changed-only pass has an estimate of its own. A full pass counts every
+    // byte the job has handled, so resuming does not restart the estimate at
+    // zero and make the ETA assume the whole archive is still ahead.
+    const doneBytes = this.changedOnly ? sessionBytes : Math.max(0, this.job?.bytes ?? 0);
     const percent = this.state === 'done'
       ? 1
       : estimateBytes > 0
-        ? Math.min(1, sessionBytes / estimateBytes)
+        ? Math.min(1, doneBytes / estimateBytes)
         : 0;
+    const rates = this.meter.snapshot();
     return {
       status: this.state,
       message: this.message,
@@ -251,7 +312,19 @@ export class Engine {
       meta: this.meta,
       live: this.live ? { ...this.live } : null,
       settings: this.settings,
-      progress: { sessionBytes, estimateBytes, percent },
+      progress: {
+        sessionBytes,
+        doneBytes,
+        estimateBytes,
+        percent,
+        remainingBytes: Math.max(0, estimateBytes - doneBytes),
+        remainingPacks: Math.max(0, (this.estimate?.packsMissing ?? 0) - (this.job?.packsDone ?? 0)),
+        remainingGames: Math.max(0, (this.estimate?.gamesInScope ?? 0) - (this.job?.gamesDone ?? 0)),
+        peakBytesPerSecond: rates.peakBytesPerSecond,
+        currentBytesPerSecond: rates.currentBytesPerSecond,
+        peakPacksPerSecond: rates.peakPacksPerSecond,
+        peakGamesPerSecond: rates.peakGamesPerSecond,
+      },
       startedAt: this.sessionStartedAt,
       retryPending: this.retries.count(),
       workers: this.gate && this.controller
@@ -570,6 +643,7 @@ export class Engine {
     }
 
     this.running = true;
+    this.catalogSize = size;
     this.state = 'running';
     this.settings = prep.settings;
     this.meta = prep.meta;
@@ -585,7 +659,6 @@ export class Engine {
     this.abort = new AbortController();
     this.live = null;
     this.inflightBytes = 0;
-    this.sessionStartBytes = this.job.bytes;
     this.inflightStarts.clear();
     this.maxReadOffset = this.job.cursor;
     this.sessionStartedAt = this.now();
@@ -598,7 +671,17 @@ export class Engine {
     this.skippedGames.clear();
     this.inflightDownloads.clear();
     this.processingGames.clear();
-    this.window = null;
+    this.orderEntries = null;
+    this.orderIndex = 0;
+    this.orderCursor = null;
+    this.inflightOrder.clear();
+    // The meter is not reset: the best rate the link delivered belongs to the
+    // connection, not to this pass, so a pause and resume keeps the peak the
+    // ETA was using.
+    this.rateSampledBytes = 0;
+    this.rateSampledPacks = 0;
+    this.rateSampledGames = 0;
+    this.rateSampledAt = this.now();
     this.gate = null;
     this.controller = null;
     this.workerCeiling = 0;
@@ -627,16 +710,43 @@ export class Engine {
     this.job.message = this.changedOnly
       ? `Downloading changes (${prep.settings.mode})`
       : prep.settings.mode === 'active' ? 'Downloading (active)' : 'Downloading (passive)';
-    if (this.job.cursor >= size) {
-      // Previous pass reached the end; this is a fresh pass over the same catalogue.
-      this.job.cursor = 0;
+    if (this.job.cursor >= size
+      || (this.job.order && this.job.order.total > 0 && this.job.order.cursor >= this.job.order.total)) {
+      // The previous pass reached the end; this is a fresh pass over the same
+      // catalogue, so its counters start again from zero.
+      this.startFreshPass();
     }
+    this.sessionStartBytes = this.job.bytes;
 
     this.taskId = this.deps.sink.createTask(`Continuum mirror (${prep.settings.mode})`);
     this.lastPersist = 0;
     this.lastTaskUpdate = 0;
     void this.runJob(prep, size);
     return { ok: true };
+  }
+
+  /**
+   * A finished pass leaves its byte and pack totals behind. A new pass over the
+   * same catalogue starts from zero; otherwise its progress bar opens at 100%
+   * and there is no remaining work to put an ETA on.
+   */
+  private startFreshPass(): void {
+    const job = this.job;
+    if (!job) {
+      return;
+    }
+    job.cursor = 0;
+    job.bytes = 0;
+    job.packsDone = 0;
+    job.packsFailed = 0;
+    job.gamesDone = 0;
+    job.gamesFailed = 0;
+    job.imagesDone = 0;
+    job.packFlagsFailed = 0;
+    if (job.order) {
+      job.order.cursor = 0;
+    }
+    this.maxReadOffset = 0;
   }
 
   pause(): boolean {
@@ -699,16 +809,16 @@ export class Engine {
           this.mainCursor = cursor;
           this.priorityCursor = new JsonlCursor<CatalogGameRecord>(this.deps.paths.catalogFile);
           if (settings.order === 'smallest') {
-            this.window = new GameWindow<CatalogGameRecord>(
-              cursor,
-              Math.max(1, this.deps.orderWindowSize ?? ORDER_WINDOW_SIZE),
-              remainingPackBytes,
-            );
+            await this.loadDownloadOrder(prep);
           }
           this.deps.log.info(
             `Starting ${settings.mode} job with ${loopCount} worker loop(s)`
             + `${adaptive ? ` (adaptive from ${startWidth}, ceiling ${activeCeiling})` : ''}`
-            + `${this.window ? ', smallest games first' : ', catalogue order'}; resuming at byte ${job.cursor}.`,
+            + (this.orderEntries
+              ? `, smallest games first (${formatCount(this.orderEntries.length)} in the queue, `
+                + `resuming at ${formatCount(this.orderIndex)})`
+              : ', catalogue order')
+            + `; resuming at byte ${job.cursor}.`,
           );
           await this.preparePriority(prep);
         }
@@ -720,17 +830,31 @@ export class Engine {
           ? setInterval(() => this.adaptConcurrency(), this.deps.adaptIntervalMs ?? ADAPT_INTERVAL_MS)
           : null;
         adaptTimer?.unref?.();
+        const rateTimer = setInterval(() => this.sampleRates(), RATE_SAMPLE_MS);
+        rateTimer.unref?.();
+        this.rateTimer = rateTimer;
+        // A short probe of a large pack gives the controller a rate to aim at
+        // while the queue is still full of tiny files.
+        this.maybeProbeBandwidth();
         try {
           await Promise.all(tasks);
         } finally {
           if (adaptTimer) {
             clearInterval(adaptTimer);
           }
+          clearInterval(rateTimer);
+          this.rateTimer = null;
+          this.sampleRates();
         }
         if (this.changedOnly) {
           // The main cursor is untouched by a changed pass; only the list position moves.
           if (this.job?.changed) {
             this.job.changed.cursor = this.changedIndex;
+          }
+        } else if (this.orderEntries) {
+          if (this.orderIndex >= this.orderEntries.length && this.inflightOrder.size === 0) {
+            job.order!.cursor = this.orderEntries.length;
+            job.cursor = catalogSize;
           }
         } else {
           job.cursor = this.currentCursor();
@@ -792,11 +916,21 @@ export class Engine {
           this.deps.log.warn(`Could not record the refused access: ${errorMessage(error)}`);
         });
       }
+      this.probeAbort?.abort();
+      this.probeAbort = null;
+      if (this.rateTimer) {
+        clearInterval(this.rateTimer);
+        this.rateTimer = null;
+      }
       this.gate?.cancel();
       this.gate = null;
       this.controller = null;
-      this.window = null;
       this.mainCursor = null;
+      if (this.orderCursor) {
+        await this.orderCursor.close().catch(() => undefined);
+      }
+      this.orderCursor = null;
+      this.inflightOrder.clear();
       this.priorityCursor = null;
       this.priorityOffsets = null;
       this.priorityPlan = null;
@@ -1033,8 +1167,8 @@ export class Engine {
           return item;
         }
       }
-      if (this.window) {
-        return this.takeWindowItem();
+      if (this.orderEntries) {
+        return this.takeOrderItem();
       }
       if (!this.mainCursor) {
         return null;
@@ -1060,34 +1194,247 @@ export class Engine {
   }
 
   /**
-   * Take the smallest remaining game in the look-ahead window. The window only
-   * moves the order; the saved cursor still points at the first game it has not
-   * handed out, so a stop or crash re-reads at most one window.
+   * Load the whole-catalogue smallest-first order for this job. The list only
+   * depends on the catalogue generation, the scope and the job key, so a pause
+   * and resume reuses it instead of reading and sorting the catalogue again.
    */
-  private async takeWindowItem(): Promise<WorkItem | null> {
-    const window = this.window!;
-    for (;;) {
-      await window.fill();
-      this.maxReadOffset = Math.max(this.maxReadOffset, window.endOffset);
-      const item = window.take();
-      if (!item) {
-        return null;
+  private async loadDownloadOrder(prep: Preparation): Promise<void> {
+    const job = this.job!;
+    // The extreme filter can change what is in scope without changing the saved
+    // scope key, so it is part of the cache key too.
+    const key = `${prep.meta.generation}|${job.scopeKey}|extreme=${prep.filter.excludeExtreme}`
+      + `|tags=${(prep.filter.extremeTags || []).join(',')}`;
+    let entries: OrderEntry[];
+    if (this.orderCache?.key === key) {
+      entries = this.orderCache.entries;
+    } else {
+      try {
+        entries = await buildDownloadOrder(
+          this.deps.paths.catalogFile,
+          (game) => matchesScope(game, prep.filter),
+        );
+      } catch (error) {
+        // A failed sort is not a reason to refuse to download: fall back to
+        // catalogue order for this run and try again next time.
+        this.deps.log.warn(`Could not build the smallest-first order: ${errorMessage(error)}`);
+        this.orderEntries = null;
+        return;
       }
-      this.inflightStarts.add(item.startOffset);
-      if (this.processingGames.has(item.value.id)) {
-        // Another worker already has this game (it came from the priority
-        // queue); leave it to them.
-        this.inflightStarts.delete(item.startOffset);
+      this.orderCache = { key, entries };
+    }
+
+    this.orderEntries = entries;
+    this.orderCursor = new JsonlCursor<CatalogGameRecord>(this.deps.paths.catalogFile);
+    const saved = job.order;
+    const sameQueue = !!saved
+      && saved.generation === prep.meta.generation
+      && saved.scopeKey === job.scopeKey;
+    const resumed = sameQueue ? Math.max(0, Math.min(saved!.cursor, entries.length)) : 0;
+    this.orderIndex = resumed >= entries.length ? 0 : resumed;
+    this.inflightOrder.clear();
+    job.order = {
+      generation: prep.meta.generation,
+      scopeKey: job.scopeKey,
+      cursor: this.orderIndex,
+      total: entries.length,
+    };
+  }
+
+  /**
+   * Take the next game in size order. Records are read by seeking, so the queue
+   * can be fully sorted without holding 221k game records in memory. A game that
+   * is already being downloaded from the priority queue is skipped; its order
+   * position is released so the saved cursor does not wait on it.
+   */
+  private async takeOrderItem(): Promise<WorkItem | null> {
+    const entries = this.orderEntries!;
+    const cursor = this.orderCursor!;
+    while (this.orderIndex < entries.length) {
+      const index = this.orderIndex;
+      this.orderIndex += 1;
+      this.inflightOrder.add(index);
+      cursor.seek(entries[index].offset);
+      const record = await cursor.next();
+      if (!record) {
+        this.inflightOrder.delete(index);
         continue;
       }
-      this.processingGames.add(item.value.id);
+      if (this.processingGames.has(record.value.id)) {
+        this.inflightOrder.delete(index);
+        continue;
+      }
+      if (!matchesScope(record.value, this.filter!)) {
+        this.inflightOrder.delete(index);
+        continue;
+      }
+      this.processingGames.add(record.value.id);
       return {
-        value: item.value,
-        offset: item.offset,
-        startOffset: item.startOffset,
+        value: record.value,
+        offset: record.offset,
+        startOffset: record.startOffset,
         priority: false,
+        orderIndex: index,
       };
     }
+    return null;
+  }
+
+  /**
+   * Record a one-second-ish window of bytes and finished packs. The meter turns
+   * these into the sustained peak the ETA and the controller use.
+   */
+  private sampleRates(): void {
+    const job = this.job;
+    if (!job) {
+      return;
+    }
+    const now = this.now();
+    const elapsed = now - this.rateSampledAt;
+    if (elapsed < 250) {
+      return;
+    }
+    this.meter.observeWindow(
+      Math.max(0, this.transferBytes - this.rateSampledBytes),
+      Math.max(0, job.packsDone - this.rateSampledPacks),
+      Math.max(0, job.gamesDone - this.rateSampledGames),
+      elapsed,
+      now,
+    );
+    this.rateSampledBytes = this.transferBytes;
+    this.rateSampledPacks = job.packsDone;
+    this.rateSampledGames = job.gamesDone;
+    this.rateSampledAt = now;
+  }
+
+  /**
+   * Warm up the peak with a short probe of a large pack the job still needs.
+   * Only adaptive active jobs do this; passive and fixed-width jobs do not need
+   * a target, so they never spend a byte on measuring one.
+   */
+  private maybeProbeBandwidth(): void {
+    if (!this.controller || !this.settings?.adaptiveWorkers) {
+      return;
+    }
+    const now = this.now();
+    if (this.lastPeakProbeAt > 0 && now - this.lastPeakProbeAt < PEAK_PROBE_INTERVAL_MS) {
+      return;
+    }
+    this.lastPeakProbeAt = now;
+    void this.probeBandwidth().catch((error) => {
+      if (!this.abort?.signal.aborted) {
+        this.deps.log.debug(`Bandwidth probe skipped: ${errorMessage(error)}`);
+      }
+    });
+  }
+
+  /**
+   * Watch one large pending pack for at most 30 seconds and keep only the
+   * rate. The bytes are thrown away, so the probe never writes a 50 GB file to
+   * the target drive; it only presses the connection long enough for the rate
+   * to plateau. What the probe measures plus what the real workers are getting
+   * at the same time is the ceiling the worker count aims for.
+   */
+  private async probeBandwidth(): Promise<void> {
+    const candidate = await this.findProbeCandidate();
+    if (!candidate) {
+      this.deps.log.debug('Bandwidth probe skipped: no pack of 16 MB or more is pending.');
+      return;
+    }
+    const sources = this.sources();
+    if (sources.length === 0) {
+      return;
+    }
+    const url = joinUrl(sources[0].baseUrl, candidate);
+    const probe = this.deps.probeSpeed || probeDownloadSpeed;
+    const controller = new AbortController();
+    const jobSignal = this.abort?.signal;
+    if (jobSignal?.aborted) {
+      return;
+    }
+    this.probeAbort = controller;
+    const onJobAbort = (): void => controller.abort();
+    if (jobSignal) {
+      jobSignal.addEventListener('abort', onJobAbort, { once: true });
+    }
+    const beforeBytes = this.transferBytes;
+    const startedAt = this.now();
+    try {
+      const result = await probe(url, { signal: controller.signal, maxMs: PEAK_PROBE_MAX_MS });
+      // The probe competes with the real workers, so their rate during the
+      // probe is part of what the connection was delivering.
+      const seconds = Math.max(0.001, (this.now() - startedAt) / 1000);
+      const concurrent = Math.max(0, this.transferBytes - beforeBytes) / seconds;
+      const measured = result.bytesPerSecond + concurrent;
+      if (result.bytes < 1024 * 1024 || result.bytesPerSecond <= 0) {
+        this.deps.log.debug('Bandwidth probe measured too little to be useful.');
+        return;
+      }
+      this.meter.observePeak(measured);
+      this.controller?.observePeak(measured);
+      this.deps.log.info(
+        `Measured link speed: ${formatBytes(measured)}/s `
+        + `(${formatBytes(result.bytesPerSecond)}/s probe, ${formatBytes(concurrent)}/s downloads, `
+        + `${Math.round(result.elapsedMs / 100) / 10} s).`,
+      );
+    } finally {
+      if (jobSignal) {
+        jobSignal.removeEventListener('abort', onJobAbort);
+      }
+      if (this.probeAbort === controller) {
+        this.probeAbort = null;
+      }
+    }
+  }
+
+  /**
+   * The largest pending pack found near the read cursor, or near the front of
+   * the catalogue on a fresh pass. The scan is bounded so a probe never turns
+   * into a catalogue walk of its own.
+   */
+  private async findProbeCandidate(): Promise<string | null> {
+    let best: { size: number; filename: string } | null = null;
+    const order = this.orderEntries;
+    // On a smallest-first run the interesting packs are at the far end of the
+    // order, which is exactly what the ordering is trying to postpone.
+    const offsets: number[] = [];
+    if (order && order.length > 0) {
+      for (let i = order.length - 1; i >= 0 && offsets.length < PEAK_PROBE_SCAN_RECORDS; i -= 1) {
+        offsets.push(order[i].offset);
+      }
+    }
+    const cursor = new JsonlCursor<CatalogGameRecord>(this.deps.paths.catalogFile);
+    try {
+      if (offsets.length > 0) {
+        for (const offset of offsets) {
+          cursor.seek(offset);
+          const record = await cursor.next();
+          if (!record) {
+            break;
+          }
+          const candidate = probeCandidateIn(record.value);
+          if (candidate && (!best || candidate.size > best.size)) {
+            best = candidate;
+            if (best.size >= PEAK_PROBE_GOOD_BYTES) {
+              break;
+            }
+          }
+        }
+      } else {
+        for (let read = 0; read < PEAK_PROBE_SCAN_RECORDS; read += 1) {
+          const record = await cursor.next();
+          if (!record) {
+            break;
+          }
+          const candidate = probeCandidateIn(record.value);
+          if (candidate && (!best || candidate.size > best.size)) {
+            best = candidate;
+          }
+        }
+      }
+    } finally {
+      await cursor.close().catch(() => undefined);
+    }
+    return best ? best.filename : null;
   }
 
   private nextWorkItem(): Promise<WorkItem | null> {
@@ -1162,6 +1509,11 @@ export class Engine {
       if (!pinned && !next.priority && next.changedIndex === undefined) {
         this.inflightStarts.delete(next.startOffset);
       }
+      // A pinned order position stays in the set, so the saved queue position
+      // rewinds to it and the game is retried instead of skipped.
+      if (!pinned && next.orderIndex !== undefined) {
+        this.inflightOrder.delete(next.orderIndex);
+      }
       await this.persist();
     }
   }
@@ -1169,12 +1521,6 @@ export class Engine {
   private currentCursor(): number {
     if (this.inflightStarts.size > 0) {
       return Math.min(...this.inflightStarts);
-    }
-    if (this.window) {
-      const earliest = this.window.earliestStartOffset;
-      if (earliest !== null) {
-        return earliest;
-      }
     }
     return this.maxReadOffset;
   }
@@ -1805,7 +2151,19 @@ export class Engine {
       return;
     }
     this.lastPersist = now;
-    this.job.cursor = this.currentCursor();
+    if (this.orderEntries && this.job.order) {
+      // The saved position is the first order entry not yet finished. Entries
+      // handed to a worker but not done stay in front of it, so a stop or crash
+      // retries those games instead of skipping them.
+      const lowest = this.inflightOrder.size > 0 ? Math.min(...this.inflightOrder) : this.orderIndex;
+      this.job.order.cursor = Math.min(this.orderEntries.length, Math.max(0, lowest));
+      this.job.order.total = this.orderEntries.length;
+      this.job.cursor = this.orderIndex >= this.orderEntries.length && this.inflightOrder.size === 0
+        ? this.catalogSize
+        : 0;
+    } else {
+      this.job.cursor = this.currentCursor();
+    }
     if (this.priorityPlan && this.job.priority) {
       this.job.priority.cursor = this.priorityPlan.index;
     }
@@ -1846,13 +2204,14 @@ export class Engine {
     }
     this.lastTaskUpdate = now;
     const sessionBytes = Math.max(0, job.bytes - this.sessionStartBytes);
-    const total = prep.estimate.totalBytes > 0 ? prep.estimate.totalBytes : sessionBytes + 1;
-    const progress = Math.min(0.995, sessionBytes / total);
+    const doneBytes = this.changedOnly ? sessionBytes : Math.max(0, job.bytes);
+    const total = prep.estimate.totalBytes > 0 ? prep.estimate.totalBytes : doneBytes + 1;
+    const progress = Math.min(0.995, doneBytes / total);
     const pieces = [
       `${formatCount(job.gamesDone)} games`,
       `${formatCount(job.packsDone)} packs`,
-      formatBytes(sessionBytes),
-      formatPercent(sessionBytes, total),
+      formatBytes(doneBytes),
+      formatPercent(doneBytes, total),
     ];
     if (job.packsFailed > 0) {
       pieces.push(`${formatCount(job.packsFailed)} failed`);
@@ -1879,6 +2238,7 @@ export class Engine {
 
   async resetJob(): Promise<void> {
     await fs.promises.unlink(this.deps.paths.jobFile).catch(() => undefined);
+    this.meter.reset();
     this.job = null;
     this.state = 'idle';
     this.message = '';
@@ -1889,14 +2249,24 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function remainingPackBytes(record: CatalogGameRecord): number {
-  let total = 0;
+/** The largest pending pack in one game that is worth probing, if any. */
+function probeCandidateIn(record: CatalogGameRecord): { size: number; filename: string } | null {
+  let best: { size: number; filename: string } | null = null;
   for (const data of record.data) {
-    if (!data.present) {
-      total += Number(data.size) || 0;
+    if (data.present) {
+      continue;
+    }
+    const size = Number(data.size) || 0;
+    if (size < PEAK_PROBE_MIN_BYTES || (best !== null && size <= best.size)) {
+      continue;
+    }
+    try {
+      best = { size, filename: gameDataFilename(data) };
+    } catch {
+      // A malformed dateAdded cannot name a file; skip it.
     }
   }
-  return total;
+  return best;
 }
 
 function estimateFor(

@@ -2,12 +2,22 @@
  * How many transfers to run at once, decided by what the connection actually
  * delivers instead of a fixed number.
  *
- * Adding a worker only helps while the bottleneck is per connection (request
- * latency, server shaping, TLS setup). Once the link is saturated, more workers
- * split the same bytes and make each game slower without finishing more of them,
- * so the controller climbs while goodput improves and settles when it does not.
- * Server failures back it off hard. The ceiling is the user's configured
- * maximum, so the archive never sees more than that from one client.
+ * The controller aims at a rate, not at "is one more better than the last
+ * sample". It remembers the best sustained goodput it has seen (and accepts a
+ * rate measured by the engine's probe) and keeps adding workers while the job
+ * is below a band around that peak. Only when the bandwidth is being pressed
+ * does it hold: at that point extra connections would just split the same bytes
+ * and make each game slower.
+ *
+ * That distinction matters for a smallest-first queue. A wall of 120 KB packs
+ * cannot show the link's real ceiling, so a controller that only climbs on a 5%
+ * improvement stops at two or four workers and leaves most of the connection
+ * idle. Knowing the peak from a large transfer gives it something to aim for,
+ * and the ramp doubles the width while it is far below, so the wall is behind
+ * the job in seconds instead of minutes.
+ *
+ * Server failures still back it off hard, and the ceiling is the user's
+ * configured maximum, so the archive never sees more than that from one client.
  */
 
 export interface ConcurrencyOptions {
@@ -33,14 +43,26 @@ export interface ConcurrencyDecision {
   reason: string;
 }
 
-/** A single sample this much worse than the best seen means "too many". */
-const REGRESSION = 0.85;
-/** A single sample this much better means "there is still room". */
+/** Within this fraction of the best rate seen, the link counts as pressed. */
+const TARGET = 0.9;
+/** A sample this much better than the best seen raises the peak. */
 const IMPROVEMENT = 1.05;
+/** Below half the peak, double the width instead of adding one. */
+const FAST_RAMP = 0.5;
+/** A sample this much worse than the peak at a wider width backs off at once. */
+const REGRESSION = 0.85;
+/** How many short samples in a row mean "the peak is stale, relearn". */
+const RELEARN_SAMPLES = 3;
 
 export class ConcurrencyController {
   private current: number;
   private bestGoodput: number | null = null;
+  /**
+   * Width that produced the best rate. Null when the peak came from a probe,
+   * where the width that produced it is not known.
+   */
+  private peakWidth: number | null = null;
+  private lowStreak = 0;
   private cooldownUntil = 0;
 
   constructor(
@@ -56,12 +78,27 @@ export class ConcurrencyController {
     return this.current;
   }
 
+  /**
+   * Accept a rate measured outside the download loop (the engine's probe of a
+   * large pack). It becomes the target the worker count climbs towards.
+   */
+  observePeak(bytesPerSecond: number): void {
+    if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) {
+      return;
+    }
+    if (this.bestGoodput === null || bytesPerSecond > this.bestGoodput) {
+      this.bestGoodput = bytesPerSecond;
+      this.peakWidth = null;
+      this.lowStreak = 0;
+    }
+  }
+
   sample(sample: ConcurrencySample): ConcurrencyDecision {
     const seconds = Math.max(0.001, sample.elapsedMs / 1000);
     const goodput = Math.max(0, sample.bytes) / seconds;
 
     if (sample.failures > 0) {
-      this.bestGoodput = null;
+      this.lowStreak = 0;
       this.cooldownUntil = this.now() + (this.options.cooldownMs ?? 60_000);
       return this.apply(Math.max(1, Math.floor(this.current / 2)), 'failures; backing off');
     }
@@ -72,26 +109,68 @@ export class ConcurrencyController {
 
     if (this.bestGoodput === null) {
       this.bestGoodput = goodput;
+      this.peakWidth = this.current;
+      this.lowStreak = 0;
       return { limit: this.current, changed: false, reason: 'learning the connection' };
     }
 
     if (goodput > this.bestGoodput * IMPROVEMENT) {
       this.bestGoodput = goodput;
+      this.peakWidth = this.current;
+      this.lowStreak = 0;
       if (this.current < this.options.max) {
         return this.apply(this.current + 1, 'throughput improved');
       }
       return { limit: this.current, changed: false, reason: 'at the ceiling' };
     }
 
-    if (goodput < this.bestGoodput * REGRESSION) {
-      this.bestGoodput = goodput;
-      if (this.current > (this.options.min ?? 1)) {
-        return this.apply(this.current - 1, 'throughput fell');
-      }
-      return { limit: this.current, changed: false, reason: 'at the floor' };
+    if (goodput >= this.bestGoodput * TARGET) {
+      this.lowStreak = 0;
+      return { limit: this.current, changed: false, reason: 'matching the measured peak' };
     }
 
-    return { limit: this.current, changed: false, reason: 'holding' };
+    if (this.current >= this.options.max) {
+      // The ceiling is already in use, so no extra worker can help.
+      return this.maybeRelearn(goodput, 'at the ceiling');
+    }
+
+    if (this.peakWidth !== null && this.current > this.peakWidth) {
+      // A connection beyond the width that produced the peak is not paying for
+      // itself. Go back to that width instead of adding more of them.
+      if (goodput < this.bestGoodput * REGRESSION) {
+        this.lowStreak = 0;
+        return this.apply(this.peakWidth, 'throughput fell');
+      }
+      return this.maybeRelearn(goodput, 'holding');
+    }
+
+    if (this.peakWidth !== null && this.current === this.peakWidth) {
+      // This width already delivered the peak, so the shortfall is the link or
+      // the server, not too few workers. Hold instead of thrashing, and lower
+      // the target if the shortfall lasts.
+      return this.maybeRelearn(goodput, 'holding');
+    }
+
+    // Below a peak measured at another width, or below a probe result: there is
+    // headroom. Close a large gap in one step so a queue of small files does
+    // not spend minutes ramping.
+    this.lowStreak = 0;
+    const next = goodput < this.bestGoodput * FAST_RAMP
+      ? Math.min(this.options.max, this.current * 2)
+      : this.current + 1;
+    return this.apply(next, 'below the measured peak');
+  }
+
+  /** Hold, and after a run of short samples accept that the peak is stale. */
+  private maybeRelearn(goodput: number, reason: string): ConcurrencyDecision {
+    this.lowStreak += 1;
+    if (this.lowStreak < RELEARN_SAMPLES) {
+      return { limit: this.current, changed: false, reason };
+    }
+    this.bestGoodput = goodput;
+    this.peakWidth = this.current;
+    this.lowStreak = 0;
+    return { limit: this.current, changed: false, reason: 'relearned the connection' };
   }
 
   private apply(limit: number, reason: string): ConcurrencyDecision {

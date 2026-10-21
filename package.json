@@ -2,7 +2,7 @@
   "name": "continuum",
   "displayName": "Continuum",
   "author": "Smealm",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "launcherVersion": "12.2.0",
   "description": "Bridges Flashpoint Infinity and Flashpoint Ultimate: uses Infinity's own on-demand sources to cache the whole archive in the background, resumably and with a disk-space guard.",
   "license": "MIT",
@@ -118,20 +118,20 @@
             "type": "string",
             "enum": ["1", "2", "3", "4", "6", "8", "10", "12", "16", "20"],
             "default": "4",
-            "description": "The most parallel downloads active mode may use. This is a hard ceiling: with adaptive parallelism on, Continuum starts lower and only goes this high when more connections actually deliver more data. Keep it modest; the archive servers are shared."
+            "description": "The most parallel downloads active mode may use. This is a hard ceiling: with adaptive parallelism on, Continuum starts at two and raises the count until the download is pressing the best speed the connection has shown. Keep it modest; the archive servers are shared."
           },
           "continuum.adaptiveWorkers": {
             "title": "Adaptive Parallelism",
             "type": "boolean",
             "default": true,
-            "description": "Measure what the connection actually delivers and use as many parallel downloads as help, up to the Active Workers ceiling. More connections only help when the server or latency is the limit; once the link is full they just split the same bandwidth, so Continuum backs off when goodput falls and halves on server failures."
+            "description": "Measure the best speed the connection delivers and use as many parallel downloads as it takes to reach it, up to the Active Workers ceiling. To learn that speed before the queue reaches a large game, a job runs one 30-second probe of a large pack at most once an hour, discarding the bytes; only adaptive active jobs do this. Within 10% of the measured peak the worker count holds, a wider width that delivers less is dropped, and server failures halve it."
           },
           "continuum.order": {
             "title": "Download Order",
             "type": "string",
             "enum": ["smallest", "catalogue"],
             "default": "smallest",
-            "description": "Smallest games first finishes far more playable games in the same total time, because the archive's sizes are heavily skewed. Total mirror time is unchanged; the big games simply arrive last. Playlist priority still wins over this. Catalogue order keeps the old sequence."
+            "description": "Smallest games first sorts the whole catalogue by remaining bytes and finishes far more playable games in the same total time, because the archive's sizes are heavily skewed. Total mirror time is unchanged; the big games simply arrive last. Playlist priority still wins over this. Catalogue order keeps the old sequence."
           },
           "continuum.passiveWorkers": {
             "title": "Passive Workers",

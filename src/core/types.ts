@@ -200,4 +200,16 @@ export interface JobState {
     cursor: number;
     total: number;
   };
+  /**
+   * Smallest-first queue position. The queue is the whole catalogue sorted by
+   * remaining bytes, rebuilt deterministically from the same generation and
+   * scope, so `cursor` (an index into it) is enough to resume. `cursor` sits at
+   * the first game not yet finished; games handed to a worker stay behind it.
+   */
+  order?: {
+    generation: string;
+    scopeKey: string;
+    cursor: number;
+    total: number;
+  };
 }

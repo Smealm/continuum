@@ -140,6 +140,111 @@ test('shows download activity, totals and speed', () => {
   assert.match(view.message, /does not stop the download/);
 });
 
+test('the ETA uses the measured peak instead of the slow first minutes of the queue', () => {
+  const now = Date.parse('2024-01-01T00:20:00.000Z');
+  const view = buildProgressView({
+    scan: idleScan,
+    engine: {
+      status: 'running',
+      message: '',
+      mode: 'active',
+      job: {
+        version: 1,
+        generation: 'g1',
+        scopeKey: 'all:|images=1',
+        mode: 'active',
+        cursor: 100,
+        bytes: 1024 * 1024 * 1024,
+        packsDone: 100,
+        packsFailed: 0,
+        gamesDone: 100,
+        gamesFailed: 0,
+        imagesDone: 0,
+        status: 'running',
+        message: 'Downloading (active)',
+        updatedAt: '2024-01-01T00:19:59.000Z',
+      },
+      meta: null,
+      live: null,
+      settings,
+      progress: {
+        sessionBytes: 100 * 1024 * 1024,
+        doneBytes: 1024 * 1024 * 1024,
+        estimateBytes: 10 * 1024 * 1024 * 1024,
+        percent: 0.1,
+        remainingBytes: 9 * 1024 * 1024 * 1024,
+        remainingPacks: 1000,
+        peakBytesPerSecond: 8 * 1024 * 1024,
+        currentBytesPerSecond: 1.5 * 1024 * 1024,
+        peakPacksPerSecond: 20,
+      },
+      startedAt: now - 600_000,
+    },
+    meta: null,
+    freeBytes: null,
+    now,
+  });
+
+  assert.equal(view.percent, 10);
+  // 9 GiB at the measured 8 MB/s, not at the 1.7 MB/s lifetime average that
+  // the wall of small games dragged down.
+  assert.match(view.timing, /1\.50 MB\/s/);
+  assert.match(view.timing, /peak 8\.00 MB\/s/);
+  assert.match(view.timing, /ETA 19m 12s/);
+});
+
+test('a queue of tiny games puts a floor under the ETA', () => {
+  const now = Date.parse('2024-01-01T00:10:00.000Z');
+  const view = buildProgressView({
+    scan: idleScan,
+    engine: {
+      status: 'running',
+      message: '',
+      mode: 'active',
+      job: {
+        version: 1,
+        generation: 'g1',
+        scopeKey: 'all:|images=1',
+        mode: 'active',
+        cursor: 100,
+        bytes: 1024,
+        packsDone: 10,
+        packsFailed: 0,
+        gamesDone: 10,
+        gamesFailed: 0,
+        imagesDone: 0,
+        status: 'running',
+        message: 'Downloading (active)',
+        updatedAt: '2024-01-01T00:09:59.000Z',
+      },
+      meta: null,
+      live: null,
+      settings,
+      progress: {
+        sessionBytes: 1024,
+        doneBytes: 1024,
+        estimateBytes: 10 * 1024 * 1024,
+        percent: 0.01,
+        remainingBytes: 10 * 1024 * 1024,
+        remainingPacks: 100,
+        remainingGames: 1000,
+        peakBytesPerSecond: 8 * 1024 * 1024,
+        currentBytesPerSecond: 1024,
+        peakPacksPerSecond: 5,
+        peakGamesPerSecond: 25,
+      },
+      startedAt: now - 60_000,
+    },
+    meta: null,
+    freeBytes: null,
+    now,
+  });
+
+  // 10 MB of bytes is a second at 8 MB/s and 100 packs is 20 s, but 1,000 games
+  // at the best rate of 25 a second takes 40 s.
+  assert.match(view.timing, /ETA 40s/);
+});
+
 test('shows a paused job as still resumable', () => {
   const now = Date.parse('2024-01-01T00:05:00.000Z');
   const job = {
