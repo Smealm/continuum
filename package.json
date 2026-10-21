@@ -1,0 +1,157 @@
+{
+  "name": "continuum",
+  "displayName": "Continuum",
+  "author": "Smealm",
+  "version": "0.1.0",
+  "launcherVersion": "12.2.0",
+  "description": "Bridges Flashpoint Infinity and Flashpoint Ultimate: uses Infinity's own on-demand sources to cache the whole archive in the background, resumably and with a disk-space guard.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Smealm/continuum.git"
+  },
+  "homepage": "https://github.com/Smealm/continuum#readme",
+  "bugs": {
+    "url": "https://github.com/Smealm/continuum/issues"
+  },
+  "main": "./dist/extension.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "watch": "tsc -w -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test --test-concurrency=1 test/*.test.js"
+  },
+  "keywords": [
+    "flashpoint",
+    "launcher",
+    "extension",
+    "offline",
+    "mirror"
+  ],
+  "contributes": {
+    "configuration": [
+      {
+        "title": "Continuum - Offline Mirror",
+        "properties": {
+          "continuum.manager": {
+            "title": "Continuum Manager",
+            "type": "button",
+            "command": "continuum.manager",
+            "description": "Status, estimates, disk space and download controls in one place."
+          },
+          "continuum.progress": {
+            "title": "Check Ongoing Progress",
+            "type": "button",
+            "command": "continuum.progress",
+            "description": "See the current catalogue rebuild or download with a live progress bar. Closing the window does not stop the job."
+          },
+          "continuum.startActive": {
+            "title": "Start Active Download",
+            "type": "button",
+            "command": "continuum.startActive",
+            "description": "Download at full speed with all workers. Confirms size and free disk space before starting."
+          },
+          "continuum.startPassive": {
+            "title": "Start Passive Download",
+            "type": "button",
+            "command": "continuum.startPassive",
+            "description": "Download slowly in the background with a single worker and pauses between games."
+          },
+          "continuum.pause": {
+            "title": "Pause Downloads",
+            "type": "button",
+            "command": "continuum.pause",
+            "description": "Finish the current game, then stop. Progress is saved and resumes later."
+          },
+          "continuum.rescan": {
+            "title": "Rebuild Catalogue",
+            "type": "button",
+            "command": "continuum.rescan",
+            "description": "Re-read every game from the launcher database (about a minute with the fast build). Needed after metadata updates or to notice files added outside Continuum."
+          },
+          "continuum.fastCatalogue": {
+            "title": "Fast Catalogue Build",
+            "type": "boolean",
+            "default": true,
+            "description": "Read the launcher database directly with the sqlite3 tool that ships in the Flashpoint folder, instead of asking the launcher for every tag. About a minute instead of hours, and identical results. Falls back to the tag scan when the tool or the database is unavailable."
+          },
+          "continuum.scope": {
+            "title": "Download Scope",
+            "type": "string",
+            "enum": ["all", "platform", "tag", "library", "playlist"],
+            "default": "all",
+            "description": "What to mirror. Use the value field below to name the platform, tag, library or playlist."
+          },
+          "continuum.scopeValue": {
+            "title": "Scope Value",
+            "type": "string",
+            "default": "",
+            "description": "Platform (Flash, HTML5), tag (Puzzle), library name or playlist title. Ignored when scope is all."
+          },
+          "continuum.includeImages": {
+            "title": "Download Logos and Screenshots",
+            "type": "boolean",
+            "default": true,
+            "description": "Cache the metadata images too, so browsing works offline. Adds roughly 30-40 GB for the whole archive."
+          },
+          "continuum.reserveGB": {
+            "title": "Keep Free Disk Space (GB)",
+            "type": "string",
+            "default": "5",
+            "description": "Continuum pauses before free space drops below this. It warns instead of filling the drive."
+          },
+          "continuum.maxTotalGB": {
+            "title": "Download Limit (GB)",
+            "type": "string",
+            "default": "0",
+            "description": "Stop after this much data in the current job. 0 means no limit."
+          },
+          "continuum.activeWorkers": {
+            "title": "Active Workers",
+            "type": "string",
+            "enum": ["1", "2", "3", "4", "6", "8"],
+            "default": "4",
+            "description": "Parallel game downloads in active mode. Keep it modest; the archive servers are shared."
+          },
+          "continuum.passiveWorkers": {
+            "title": "Passive Workers",
+            "type": "string",
+            "enum": ["1", "2"],
+            "default": "1",
+            "description": "Parallel game downloads in passive mode."
+          },
+          "continuum.passiveDelayMs": {
+            "title": "Passive Delay (ms)",
+            "type": "string",
+            "enum": ["0", "250", "500", "1000", "2000", "5000"],
+            "default": "750",
+            "description": "Pause after each game in passive mode."
+          },
+          "continuum.respectExtremeFilter": {
+            "title": "Respect Extreme Game Setting",
+            "type": "boolean",
+            "default": true,
+            "description": "Skip games the launcher hides with its extreme content filter."
+          },
+          "continuum.autoResume": {
+            "title": "Resume On Launcher Startup",
+            "type": "boolean",
+            "default": false,
+            "description": "Continue an unfinished job when the launcher starts."
+          }
+        }
+      }
+    ],
+    "contextButtons": [
+      {
+        "context": "playlist",
+        "name": "Mirror with Continuum",
+        "command": "continuum.mirrorPlaylist"
+      }
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^16.18.120",
+    "typescript": "^5.7.2"
+  }
+}
